@@ -10,6 +10,9 @@ pub enum WorkerCommand {
         table_name: String,
         exact_item_count: bool,
     },
+    CancelMetadataLoad {
+        request_id: u64,
+    },
 }
 
 #[derive(Debug)]

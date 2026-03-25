@@ -40,6 +40,7 @@ pub enum DynamoError {
     },
 }
 
+#[derive(Clone)]
 pub struct DynamoDbService {
     client: aws_sdk_dynamodb::Client,
 }

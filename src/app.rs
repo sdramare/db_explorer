@@ -1,7 +1,7 @@
 use std::sync::mpsc::Receiver;
 
 use eframe::egui;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tracing::{debug, info, warn};
 
 use crate::aws::dynamodb::TableMetadata;
@@ -12,6 +12,7 @@ pub enum MetadataState {
     Idle,
     Loading,
     Loaded(TableMetadata),
+    Canceled,
     Error(String),
 }
 
@@ -87,6 +88,12 @@ impl AppState {
         self.metadata_state = MetadataState::Error(error);
     }
 
+    pub fn cancel_metadata_load(&mut self) -> Option<u64> {
+        let request_id = self.active_metadata_request.take()?;
+        self.metadata_state = MetadataState::Canceled;
+        Some(request_id)
+    }
+
     pub fn handle_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::TablesLoaded { request_id, result } => {
@@ -151,16 +158,13 @@ impl Default for AppState {
 
 pub struct DbExplorerApp {
     state: AppState,
-    command_tx: UnboundedSender<WorkerCommand>,
+    command_tx: Sender<WorkerCommand>,
     event_rx: Receiver<WorkerEvent>,
     confirm_exact_recount: bool,
 }
 
 impl DbExplorerApp {
-    pub fn new(
-        command_tx: UnboundedSender<WorkerCommand>,
-        event_rx: Receiver<WorkerEvent>,
-    ) -> Self {
+    pub fn new(command_tx: Sender<WorkerCommand>, event_rx: Receiver<WorkerEvent>) -> Self {
         let mut app = Self {
             state: AppState::new(),
             command_tx,
@@ -176,27 +180,48 @@ impl DbExplorerApp {
         info!(request_id, "ui: requesting table list");
         if let Err(err) = self
             .command_tx
-            .send(WorkerCommand::LoadTables { request_id })
+            .try_send(WorkerCommand::LoadTables { request_id })
         {
-            warn!(error = %err, "ui: failed to send table list request to worker");
-            self.state.fail_tables_refresh(format!(
-                "Unable to request table list: worker is unavailable ({err})"
-            ));
+            warn!(error = ?err, "ui: failed to send table list request to worker");
+            let details = match err {
+                TrySendError::Full(_) => "worker queue is full".to_string(),
+                TrySendError::Closed(_) => "worker is unavailable".to_string(),
+            };
+            self.state
+                .fail_tables_refresh(format!("Unable to request table list: {details}"));
         }
     }
 
     fn request_metadata(&mut self, table_name: String, exact_item_count: bool) {
+        self.confirm_exact_recount = false;
         let request_id = self.state.begin_metadata_load(&table_name);
         info!(request_id, table_name = %table_name, exact_item_count, "ui: requesting table metadata");
-        if let Err(err) = self.command_tx.send(WorkerCommand::LoadTableMetadata {
+        if let Err(err) = self.command_tx.try_send(WorkerCommand::LoadTableMetadata {
             request_id,
             table_name,
             exact_item_count,
         }) {
-            warn!(error = %err, "ui: failed to send metadata request to worker");
-            self.state.fail_metadata_load(format!(
-                "Unable to request table metadata: worker is unavailable ({err})"
-            ));
+            warn!(error = ?err, "ui: failed to send metadata request to worker");
+            let details = match err {
+                TrySendError::Full(_) => "worker queue is full".to_string(),
+                TrySendError::Closed(_) => "worker is unavailable".to_string(),
+            };
+            self.state
+                .fail_metadata_load(format!("Unable to request table metadata: {details}"));
+        }
+    }
+
+    fn cancel_metadata_load(&mut self) {
+        let Some(request_id) = self.state.cancel_metadata_load() else {
+            return;
+        };
+
+        info!(request_id, "ui: cancel metadata load clicked");
+        if let Err(err) = self
+            .command_tx
+            .try_send(WorkerCommand::CancelMetadataLoad { request_id })
+        {
+            warn!(error = ?err, "ui: failed to send cancel metadata request to worker");
         }
     }
 
@@ -237,6 +262,12 @@ impl DbExplorerApp {
                     "Number of items (approximate)"
                 };
                 ui.label(format!("{count_label}: {}", metadata.item_count));
+            }
+            MetadataState::Canceled => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(170, 110, 30),
+                    "Metadata load canceled.",
+                );
             }
             MetadataState::Error(err) => {
                 ui.colored_label(egui::Color32::from_rgb(180, 30, 30), err);
@@ -282,7 +313,6 @@ impl eframe::App for DbExplorerApp {
                     && let Some(selected) = self.state.selected_table.clone()
                 {
                     info!(table_name = %selected, "ui: table selection changed");
-                    self.confirm_exact_recount = false;
                     self.request_metadata(selected, false);
                 }
 
@@ -308,6 +338,16 @@ impl eframe::App for DbExplorerApp {
                     } else {
                         self.confirm_exact_recount = true;
                     }
+                }
+
+                if ui
+                    .add_enabled(
+                        matches!(self.state.metadata_state, MetadataState::Loading),
+                        egui::Button::new("Cancel load"),
+                    )
+                    .clicked()
+                {
+                    self.cancel_metadata_load();
                 }
             });
 
@@ -439,7 +479,7 @@ mod tests {
 
     #[test]
     fn app_new_requests_tables_immediately() {
-        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
         let (_event_tx, event_rx) = mpsc::channel();
 
         let app = DbExplorerApp::new(command_tx, event_rx);
@@ -456,7 +496,7 @@ mod tests {
 
     #[test]
     fn app_new_surfaces_worker_unavailable_for_tables() {
-        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(1);
         drop(command_rx);
         let (_event_tx, event_rx) = mpsc::channel();
 
@@ -475,7 +515,7 @@ mod tests {
 
     #[test]
     fn request_metadata_surfaces_worker_unavailable() {
-        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
         let (_event_tx, event_rx) = mpsc::channel();
 
         let mut app = DbExplorerApp::new(command_tx, event_rx);
@@ -492,7 +532,7 @@ mod tests {
 
     #[test]
     fn drain_events_applies_worker_updates() {
-        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::channel();
 
         let mut app = DbExplorerApp::new(command_tx, event_rx);
@@ -523,6 +563,16 @@ mod tests {
             state.metadata_state,
             MetadataState::Error("worker down".to_string())
         );
+        assert!(!state.has_pending_requests());
+    }
+
+    #[test]
+    fn cancel_metadata_load_clears_pending_state() {
+        let mut state = AppState::new();
+        let request_id = state.begin_metadata_load("orders");
+
+        assert_eq!(state.cancel_metadata_load(), Some(request_id));
+        assert_eq!(state.metadata_state, MetadataState::Canceled);
         assert!(!state.has_pending_requests());
     }
 
