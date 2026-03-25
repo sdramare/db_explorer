@@ -813,6 +813,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-types-convert"
+version = "0.60.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e50da9f5e3ecf145b4f6eb04963e6fbf52f528017de0784a28c56b9407414b1"
+dependencies = [
+ "aws-smithy-types",
+ "chrono",
+]
+
+[[package]]
 name = "aws-smithy-xml"
 version = "0.60.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1251,10 +1261,12 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-dynamodb",
+ "aws-smithy-types-convert",
  "chrono",
  "eframe",
  "egui",
  "serial_test",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

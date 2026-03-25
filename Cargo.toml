@@ -16,6 +16,10 @@ egui = "0.33.3"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+thiserror = "2.0.18"
+aws-smithy-types-convert = { version = "0.60.13", features = [
+    "convert-chrono",
+] }
 
 [dev-dependencies]
 serial_test = "3.2.0"

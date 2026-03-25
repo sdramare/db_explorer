@@ -22,7 +22,7 @@ async fn main() -> Result<(), eframe::Error> {
             match command {
                 WorkerCommand::LoadTables { request_id } => {
                     info!(request_id, "worker: loading table list");
-                    let result = service.list_tables().await;
+                    let result = service.list_tables().await.map_err(|err| err.to_string());
                     if let Err(err) = &result {
                         error!(request_id, error = %err, "worker: failed to load table list");
                     }
@@ -43,7 +43,8 @@ async fn main() -> Result<(), eframe::Error> {
                     info!(request_id, table_name = %table_name, exact_item_count, "worker: loading table metadata");
                     let result = service
                         .load_table_metadata(&table_name, exact_item_count)
-                        .await;
+                        .await
+                        .map_err(|err| err.to_string());
                     if let Err(err) = &result {
                         error!(request_id, table_name = %table_name, error = %err, "worker: failed to load table metadata");
                     }

@@ -1,6 +1,9 @@
 use aws_config::BehaviorVersion;
+use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_dynamodb::types::Select;
+use aws_smithy_types_convert::date_time::DateTimeExt;
 use chrono::{DateTime, Local, Utc};
+use thiserror::Error;
 use tracing::{debug, info, instrument};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +20,23 @@ impl TableMetadata {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum DynamoError {
+    #[error("Describe table failed: missing table details in AWS response")]
+    MissingTableDetails,
+    #[error("{context} failed: AWS credentials are not available for the current profile")]
+    CredentialsUnavailable { context: &'static str },
+    #[error("{context} failed: access denied for the current profile")]
+    AccessDenied { context: &'static str },
+    #[error("{context} failed: AWS region is not configured")]
+    RegionNotConfigured { context: &'static str },
+    #[error("{context} failed: {details}")]
+    Aws {
+        context: &'static str,
+        details: String,
+    },
+}
+
 pub struct DynamoDbService {
     client: aws_sdk_dynamodb::Client,
 }
@@ -30,7 +50,7 @@ impl DynamoDbService {
     }
 
     #[instrument(name = "dynamodb.list_tables", skip(self))]
-    pub async fn list_tables(&self) -> Result<Vec<String>, String> {
+    pub async fn list_tables(&self) -> Result<Vec<String>, DynamoError> {
         let mut all_tables = Vec::new();
         let mut start_name: Option<String> = None;
         let mut pages = 0_u64;
@@ -45,7 +65,7 @@ impl DynamoDbService {
             let response = request
                 .send()
                 .await
-                .map_err(|err| map_service_error("List tables", &err.to_string()))?;
+                .map_err(|err| map_sdk_error("List tables", &err))?;
 
             if let Some(mut names) = response.table_names {
                 all_tables.append(&mut names);
@@ -67,18 +87,16 @@ impl DynamoDbService {
         &self,
         table_name: &str,
         exact_item_count: bool,
-    ) -> Result<TableMetadata, String> {
+    ) -> Result<TableMetadata, DynamoError> {
         let description = self
             .client
             .describe_table()
             .table_name(table_name)
             .send()
             .await
-            .map_err(|err| map_service_error("Describe table", &err.to_string()))?;
+            .map_err(|err| map_sdk_error("Describe table", &err))?;
 
-        let table = description.table.ok_or_else(|| {
-            "Describe table failed: missing table details in AWS response".to_string()
-        })?;
+        let table = description.table.ok_or(DynamoError::MissingTableDetails)?;
 
         let created_at = table.creation_date_time.and_then(smithy_to_chrono);
         let approximate_count = table.item_count.unwrap_or_default().max(0) as u64;
@@ -99,7 +117,7 @@ impl DynamoDbService {
     }
 
     #[instrument(name = "dynamodb.count_items_exact", skip(self), fields(table_name = %table_name))]
-    async fn count_items_exact(&self, table_name: &str) -> Result<u64, String> {
+    async fn count_items_exact(&self, table_name: &str) -> Result<u64, DynamoError> {
         let mut total = 0_u64;
         let mut last_key: Option<
             std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
@@ -120,7 +138,7 @@ impl DynamoDbService {
             let response = request
                 .send()
                 .await
-                .map_err(|err| map_service_error("Count table items", &err.to_string()))?;
+                .map_err(|err| map_sdk_error("Count table items", &err))?;
 
             total = total.saturating_add(normalize_page_count(response.count));
             debug!(
@@ -149,12 +167,7 @@ impl DynamoDbService {
 }
 
 fn smithy_to_chrono(timestamp: aws_sdk_dynamodb::primitives::DateTime) -> Option<DateTime<Utc>> {
-    let seconds = timestamp.as_secs_f64();
-    let whole_seconds = seconds.floor() as i64;
-    let nanos = ((seconds - whole_seconds as f64) * 1_000_000_000.0)
-        .clamp(0.0, 999_999_999.0)
-        .round() as u32;
-    DateTime::<Utc>::from_timestamp(whole_seconds, nanos)
+    timestamp.to_chrono_utc().ok()
 }
 
 pub fn format_creation_date(created_at: Option<DateTime<Utc>>) -> String {
@@ -171,32 +184,53 @@ fn normalize_page_count(count: i32) -> u64 {
     count.max(0) as u64
 }
 
-fn map_service_error(context: &str, raw: &str) -> String {
-    let lower = raw.to_lowercase();
+fn map_sdk_error<E, R>(context: &'static str, err: &SdkError<E, R>) -> DynamoError
+where
+    E: ProvideErrorMetadata,
+{
+    let (code, message) = if let Some(service_err) = err.as_service_error() {
+        (service_err.code(), service_err.message())
+    } else {
+        (None, None)
+    };
 
-    if lower.contains("credential")
-        || lower.contains("invalidclienttokenid")
-        || lower.contains("unrecognizedclient")
-    {
-        return format!(
-            "{context} failed: AWS credentials are not available for the current profile"
-        );
+    if matches!(
+        code,
+        Some("UnrecognizedClientException") | Some("InvalidClientTokenId")
+    ) {
+        return DynamoError::CredentialsUnavailable { context };
     }
 
-    if lower.contains("accessdenied") || lower.contains("not authorized") {
-        return format!("{context} failed: access denied for the current profile");
+    if matches!(
+        code,
+        Some("AccessDeniedException") | Some("UnauthorizedOperation")
+    ) {
+        return DynamoError::AccessDenied { context };
     }
 
+    let details = message.unwrap_or("Unknown AWS SDK error").to_string();
+
+    let lower = details.to_lowercase();
+    if lower.contains("credential") {
+        return DynamoError::CredentialsUnavailable { context };
+    }
     if lower.contains("region") && lower.contains("not") && lower.contains("configured") {
-        return format!("{context} failed: AWS region is not configured");
+        return DynamoError::RegionNotConfigured { context };
     }
 
-    format!("{context} failed: {raw}")
+    DynamoError::Aws {
+        context,
+        details: if details == "Unknown AWS SDK error" {
+            err.to_string()
+        } else {
+            details
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_creation_date, map_service_error, normalize_page_count};
+    use super::{DynamoError, format_creation_date, normalize_page_count};
     use chrono::{DateTime, Utc};
 
     #[test]
@@ -220,14 +254,19 @@ mod tests {
     }
 
     #[test]
-    fn map_service_error_credentials() {
-        let msg = map_service_error("List tables", "UnrecognizedClientException");
-        assert!(msg.contains("credentials are not available"));
+    fn typed_error_for_missing_table_details() {
+        assert_eq!(
+            DynamoError::MissingTableDetails.to_string(),
+            "Describe table failed: missing table details in AWS response"
+        );
     }
 
     #[test]
-    fn map_service_error_access_denied() {
-        let msg = map_service_error("Describe table", "AccessDeniedException");
+    fn typed_error_for_access_denied() {
+        let msg = DynamoError::AccessDenied {
+            context: "Describe table",
+        }
+        .to_string();
         assert!(msg.contains("access denied"));
     }
 
