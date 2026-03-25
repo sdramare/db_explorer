@@ -16,18 +16,38 @@ async fn main() -> Result<(), eframe::Error> {
 
     tokio::spawn(async move {
         info!("starting DynamoDB worker");
-        let service = DynamoDbService::new().await;
-        if let Err(err) = &service {
-            error!(error = %err, "worker: failed to initialize DynamoDB service");
-        }
+        let mut service = match DynamoDbService::new().await {
+            Ok(service) => Some(service),
+            Err(err) => {
+                let message = err.to_string();
+                error!(error = %message, "worker: failed to initialize DynamoDB service");
+                None
+            }
+        };
 
         while let Some(command) = command_rx.recv().await {
+            if service.is_none() {
+                info!("worker: retrying DynamoDB service initialization");
+                service = match DynamoDbService::new().await {
+                    Ok(service) => {
+                        info!("worker: DynamoDB service initialized successfully");
+                        Some(service)
+                    }
+                    Err(err) => {
+                        error!(error = %err, "worker: DynamoDB service initialization retry failed");
+                        None
+                    }
+                };
+            }
+
             match command {
                 WorkerCommand::LoadTables { request_id } => {
                     info!(request_id, "worker: loading table list");
-                    let result = match &service {
-                        Ok(service) => service.list_tables().await.map_err(|err| err.to_string()),
-                        Err(err) => Err(err.to_string()),
+                    let result = match service.as_ref() {
+                        Some(service) => {
+                            service.list_tables().await.map_err(|err| err.to_string())
+                        }
+                        None => Err("DynamoDB client is unavailable. Check AWS region/credentials and retry.".to_string()),
                     };
                     if let Err(err) = &result {
                         error!(request_id, error = %err, "worker: failed to load table list");
@@ -47,12 +67,12 @@ async fn main() -> Result<(), eframe::Error> {
                     exact_item_count,
                 } => {
                     info!(request_id, table_name = %table_name, exact_item_count, "worker: loading table metadata");
-                    let result = match &service {
-                        Ok(service) => service
+                    let result = match service.as_ref() {
+                        Some(service) => service
                             .load_table_metadata(&table_name, exact_item_count)
                             .await
                             .map_err(|err| err.to_string()),
-                        Err(err) => Err(err.to_string()),
+                        None => Err("DynamoDB client is unavailable. Check AWS region/credentials and retry.".to_string()),
                     };
                     if let Err(err) = &result {
                         error!(request_id, table_name = %table_name, error = %err, "worker: failed to load table metadata");

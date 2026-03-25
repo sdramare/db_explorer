@@ -63,12 +63,23 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn begin_metadata_load(&mut self, table_name: String) -> u64 {
+    pub fn begin_metadata_load(&mut self, table_name: &str) -> u64 {
         let request_id = self.next_id();
-        self.selected_table = Some(table_name);
+        self.selected_table = Some(table_name.to_string());
         self.metadata_state = MetadataState::Loading;
         self.active_metadata_request = Some(request_id);
         request_id
+    }
+
+    pub fn update_selected_table(&mut self, table_name: Option<String>) -> bool {
+        if self.selected_table == table_name {
+            return false;
+        }
+
+        self.selected_table = table_name;
+        self.active_metadata_request = None;
+        self.metadata_state = MetadataState::Idle;
+        true
     }
 
     pub fn fail_metadata_load(&mut self, error: String) {
@@ -142,6 +153,7 @@ pub struct DbExplorerApp {
     state: AppState,
     command_tx: UnboundedSender<WorkerCommand>,
     event_rx: Receiver<WorkerEvent>,
+    confirm_exact_recount: bool,
 }
 
 impl DbExplorerApp {
@@ -153,6 +165,7 @@ impl DbExplorerApp {
             state: AppState::new(),
             command_tx,
             event_rx,
+            confirm_exact_recount: false,
         };
         app.request_tables();
         app
@@ -173,7 +186,7 @@ impl DbExplorerApp {
     }
 
     fn request_metadata(&mut self, table_name: String, exact_item_count: bool) {
-        let request_id = self.state.begin_metadata_load(table_name.clone());
+        let request_id = self.state.begin_metadata_load(&table_name);
         info!(request_id, table_name = %table_name, exact_item_count, "ui: requesting table metadata");
         if let Err(err) = self.command_tx.send(WorkerCommand::LoadTableMetadata {
             request_id,
@@ -264,28 +277,46 @@ impl eframe::App for DbExplorerApp {
                             ui.selectable_value(&mut pending_selection, Some(table.clone()), table);
                         }
                     });
-                self.state.selected_table = pending_selection;
-
-                if self.state.selected_table != previous_selection
+                if pending_selection != previous_selection
+                    && self.state.update_selected_table(pending_selection)
                     && let Some(selected) = self.state.selected_table.clone()
                 {
                     info!(table_name = %selected, "ui: table selection changed");
+                    self.confirm_exact_recount = false;
                     self.request_metadata(selected, false);
                 }
+
+                let recount_label = if self.confirm_exact_recount {
+                    "Confirm exact recount"
+                } else {
+                    "Recount exactly"
+                };
 
                 if ui
                     .add_enabled(
                         self.state.selected_table.is_some()
                             && !matches!(self.state.metadata_state, MetadataState::Loading),
-                        egui::Button::new("Recount exactly"),
+                        egui::Button::new(recount_label),
                     )
                     .clicked()
                     && let Some(selected) = self.state.selected_table.clone()
                 {
-                    info!(table_name = %selected, "ui: exact recount requested");
-                    self.request_metadata(selected, true);
+                    if self.confirm_exact_recount {
+                        info!(table_name = %selected, "ui: exact recount confirmed");
+                        self.confirm_exact_recount = false;
+                        self.request_metadata(selected, true);
+                    } else {
+                        self.confirm_exact_recount = true;
+                    }
                 }
             });
+
+            if self.confirm_exact_recount {
+                ui.colored_label(
+                    egui::Color32::from_rgb(170, 110, 30),
+                    "Exact recount scans every item and may be slow or costly. Click again to confirm.",
+                );
+            }
 
             if self.state.tables_loading {
                 ui.horizontal(|ui| {
@@ -352,7 +383,7 @@ mod tests {
     #[test]
     fn ignores_stale_metadata_response() {
         let mut state = AppState::new();
-        let current_request_id = state.begin_metadata_load("users".to_string());
+        let current_request_id = state.begin_metadata_load("users");
 
         let stale_id = current_request_id.saturating_sub(1);
         state.handle_event(WorkerEvent::TableMetadataLoaded {
@@ -372,7 +403,7 @@ mod tests {
     #[test]
     fn metadata_error_is_stored() {
         let mut state = AppState::new();
-        let request_id = state.begin_metadata_load("orders".to_string());
+        let request_id = state.begin_metadata_load("orders");
 
         state.handle_event(WorkerEvent::TableMetadataLoaded {
             request_id,
@@ -389,7 +420,7 @@ mod tests {
     #[test]
     fn selection_change_moves_to_loading() {
         let mut state = AppState::new();
-        let _request_id = state.begin_metadata_load("users".to_string());
+        let _request_id = state.begin_metadata_load("users");
         assert_eq!(state.selected_table.as_deref(), Some("users"));
         assert_eq!(state.metadata_state, MetadataState::Loading);
     }
@@ -484,7 +515,7 @@ mod tests {
     #[test]
     fn fail_metadata_load_sets_error_and_clears_pending_state() {
         let mut state = AppState::new();
-        let _ = state.begin_metadata_load("orders".to_string());
+        let _ = state.begin_metadata_load("orders");
 
         state.fail_metadata_load("worker down".to_string());
 

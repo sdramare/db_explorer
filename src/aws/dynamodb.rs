@@ -110,7 +110,7 @@ impl DynamoDbService {
         let item_count = if exact_item_count {
             self.count_items_exact(table_name).await?
         } else {
-            table.item_count.unwrap_or_default().max(0) as u64
+            normalize_table_item_count(table.item_count)
         };
 
         info!(item_count, exact_item_count, "loaded table metadata");
@@ -207,6 +207,10 @@ fn normalize_page_count(count: i32) -> u64 {
     count.max(0) as u64
 }
 
+fn normalize_table_item_count(item_count: Option<i64>) -> u64 {
+    item_count.unwrap_or_default().max(0) as u64
+}
+
 fn map_sdk_error<E, R>(context: &'static str, err: &SdkError<E, R>) -> DynamoError
 where
     E: ProvideErrorMetadata,
@@ -233,6 +237,7 @@ where
 
     let details = message.unwrap_or("Unknown AWS SDK error").to_string();
 
+    // Fallback for SDK errors that do not expose structured service codes.
     let lower = details.to_lowercase();
     if lower.contains("credential") {
         return DynamoError::CredentialsUnavailable { context };
@@ -253,7 +258,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamoError, format_creation_date, normalize_page_count};
+    use super::{
+        DynamoError, format_creation_date, normalize_page_count, normalize_table_item_count,
+    };
     use chrono::{DateTime, Utc};
 
     #[test]
@@ -274,6 +281,13 @@ mod tests {
     fn normalize_page_count_empty_page() {
         assert_eq!(normalize_page_count(0), 0);
         assert_eq!(normalize_page_count(-4), 0);
+    }
+
+    #[test]
+    fn normalize_table_item_count_non_negative() {
+        assert_eq!(normalize_table_item_count(Some(12)), 12);
+        assert_eq!(normalize_table_item_count(Some(-1)), 0);
+        assert_eq!(normalize_table_item_count(None), 0);
     }
 
     #[test]
