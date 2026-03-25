@@ -17,12 +17,18 @@ async fn main() -> Result<(), eframe::Error> {
     tokio::spawn(async move {
         info!("starting DynamoDB worker");
         let service = DynamoDbService::new().await;
+        if let Err(err) = &service {
+            error!(error = %err, "worker: failed to initialize DynamoDB service");
+        }
 
         while let Some(command) = command_rx.recv().await {
             match command {
                 WorkerCommand::LoadTables { request_id } => {
                     info!(request_id, "worker: loading table list");
-                    let result = service.list_tables().await.map_err(|err| err.to_string());
+                    let result = match &service {
+                        Ok(service) => service.list_tables().await.map_err(|err| err.to_string()),
+                        Err(err) => Err(err.to_string()),
+                    };
                     if let Err(err) = &result {
                         error!(request_id, error = %err, "worker: failed to load table list");
                     }
@@ -41,10 +47,13 @@ async fn main() -> Result<(), eframe::Error> {
                     exact_item_count,
                 } => {
                     info!(request_id, table_name = %table_name, exact_item_count, "worker: loading table metadata");
-                    let result = service
-                        .load_table_metadata(&table_name, exact_item_count)
-                        .await
-                        .map_err(|err| err.to_string());
+                    let result = match &service {
+                        Ok(service) => service
+                            .load_table_metadata(&table_name, exact_item_count)
+                            .await
+                            .map_err(|err| err.to_string()),
+                        Err(err) => Err(err.to_string()),
+                    };
                     if let Err(err) = &result {
                         error!(request_id, table_name = %table_name, error = %err, "worker: failed to load table metadata");
                     }

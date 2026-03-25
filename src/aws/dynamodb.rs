@@ -4,7 +4,10 @@ use aws_sdk_dynamodb::types::Select;
 use aws_smithy_types_convert::date_time::DateTimeExt;
 use chrono::{DateTime, Local, Utc};
 use thiserror::Error;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
+
+const EXACT_COUNT_WARN_THRESHOLD_PAGES: u64 = 100;
+const EXACT_COUNT_MAX_PAGES: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMetadata {
@@ -43,10 +46,15 @@ pub struct DynamoDbService {
 
 impl DynamoDbService {
     #[instrument(name = "dynamodb.init_client")]
-    pub async fn new() -> Self {
+    pub async fn new() -> Result<Self, DynamoError> {
         let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        if config.region().is_none() {
+            return Err(DynamoError::RegionNotConfigured {
+                context: "Initialize DynamoDB client",
+            });
+        }
         let client = aws_sdk_dynamodb::Client::new(&config);
-        Self { client }
+        Ok(Self { client })
     }
 
     #[instrument(name = "dynamodb.list_tables", skip(self))]
@@ -99,11 +107,10 @@ impl DynamoDbService {
         let table = description.table.ok_or(DynamoError::MissingTableDetails)?;
 
         let created_at = table.creation_date_time.and_then(smithy_to_chrono);
-        let approximate_count = table.item_count.unwrap_or_default().max(0) as u64;
         let item_count = if exact_item_count {
             self.count_items_exact(table_name).await?
         } else {
-            approximate_count
+            table.item_count.unwrap_or_default().max(0) as u64
         };
 
         info!(item_count, exact_item_count, "loaded table metadata");
@@ -126,6 +133,22 @@ impl DynamoDbService {
 
         loop {
             pages = pages.saturating_add(1);
+            if pages == EXACT_COUNT_WARN_THRESHOLD_PAGES {
+                warn!(
+                    table_name = %table_name,
+                    pages,
+                    "exact count is scanning many pages; this can be expensive"
+                );
+            }
+            if pages > EXACT_COUNT_MAX_PAGES {
+                return Err(DynamoError::Aws {
+                    context: "Count table items",
+                    details: format!(
+                        "aborted exact count after {EXACT_COUNT_MAX_PAGES} pages to limit scan cost"
+                    ),
+                });
+            }
+
             let mut request = self
                 .client
                 .scan()
@@ -170,7 +193,7 @@ fn smithy_to_chrono(timestamp: aws_sdk_dynamodb::primitives::DateTime) -> Option
     timestamp.to_chrono_utc().ok()
 }
 
-pub fn format_creation_date(created_at: Option<DateTime<Utc>>) -> String {
+fn format_creation_date(created_at: Option<DateTime<Utc>>) -> String {
     match created_at {
         Some(ts) => ts
             .with_timezone(&Local)

@@ -187,11 +187,15 @@ impl DbExplorerApp {
         }
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self) -> bool {
+        let mut received = false;
         while let Ok(event) = self.event_rx.try_recv() {
             debug!(?event, "ui: received worker event");
             self.state.handle_event(event);
+            received = true;
         }
+
+        received
     }
 
     fn render_metadata_panel(&self, ui: &mut egui::Ui) {
@@ -230,7 +234,7 @@ impl DbExplorerApp {
 
 impl eframe::App for DbExplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain_events();
+        let events_processed = self.drain_events();
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -306,7 +310,7 @@ impl eframe::App for DbExplorerApp {
             self.render_metadata_panel(ui);
         });
 
-        if self.state.has_pending_requests() {
+        if events_processed || self.state.has_pending_requests() {
             ctx.request_repaint();
         }
     }

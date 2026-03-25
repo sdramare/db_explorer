@@ -1,6 +1,6 @@
 use crate::aws::dynamodb::TableMetadata;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum WorkerCommand {
     LoadTables {
         request_id: u64,
@@ -12,7 +12,7 @@ pub enum WorkerCommand {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum WorkerEvent {
     TablesLoaded {
         request_id: u64,
