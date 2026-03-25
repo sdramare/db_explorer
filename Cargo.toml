@@ -3,4 +3,20 @@ name = "db_explorer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+live-aws-tests = []
+
 [dependencies]
+aws-config = { version = "1.8.10", features = ["credentials-login"] }
+aws-sdk-dynamodb = "1.98.0"
+chrono = { version = "0.4.42", features = ["clock"] }
+eframe = "0.33.2"
+egui = "0.33.3"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+
+[dev-dependencies]
+mockall = "0.13.1"
+serial_test = "3.2.0"
