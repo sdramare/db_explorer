@@ -1,13 +1,17 @@
 use aws_config::BehaviorVersion;
 use aws_sdk_dynamodb::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_dynamodb::types::Select;
+use aws_sdk_dynamodb::types::{AttributeValue, Select};
 use aws_smithy_types_convert::date_time::DateTimeExt;
+use base64::Engine;
 use chrono::{DateTime, Local, Utc};
+use serde_json::{Map, Number, Value};
+use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
 const EXACT_COUNT_WARN_THRESHOLD_PAGES: u64 = 100;
 const EXACT_COUNT_MAX_PAGES: u64 = 10_000;
+const EXPORT_WARN_THRESHOLD_PAGES: u64 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMetadata {
@@ -15,6 +19,13 @@ pub struct TableMetadata {
     pub created_at: Option<DateTime<Utc>>,
     pub item_count: u64,
     pub item_count_is_exact: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableExportSummary {
+    pub table_name: String,
+    pub output_path: String,
+    pub item_count: u64,
 }
 
 impl TableMetadata {
@@ -35,6 +46,11 @@ pub enum DynamoError {
     RegionNotConfigured { context: &'static str },
     #[error("{context} failed: {details}")]
     Aws {
+        context: &'static str,
+        details: String,
+    },
+    #[error("{context} failed: {details}")]
+    Local {
         context: &'static str,
         details: String,
     },
@@ -188,6 +204,140 @@ impl DynamoDbService {
         info!(pages, total, "finished exact table count");
         Ok(total)
     }
+
+    #[instrument(name = "dynamodb.export_table_to_json", skip(self), fields(table_name = %table_name, output_path = %output_path.display(), pretty_print = pretty_print))]
+    pub async fn export_table_to_json_file(
+        &self,
+        table_name: &str,
+        output_path: &Path,
+        pretty_print: bool,
+    ) -> Result<TableExportSummary, DynamoError> {
+        let mut items = Vec::<Value>::new();
+        let mut last_key: Option<std::collections::HashMap<String, AttributeValue>> = None;
+        let mut pages = 0_u64;
+
+        loop {
+            pages = pages.saturating_add(1);
+            if pages == EXPORT_WARN_THRESHOLD_PAGES {
+                warn!(
+                    table_name = %table_name,
+                    pages,
+                    "export is scanning many pages; this may be slow and memory-intensive"
+                );
+            }
+
+            let mut request = self.client.scan().table_name(table_name);
+            if let Some(key) = &last_key {
+                request = request.set_exclusive_start_key(Some(key.clone()));
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|err| map_sdk_error("Export table to JSON", &err))?;
+
+            if let Some(page_items) = response.items {
+                for item in page_items {
+                    items.push(attribute_map_to_json(item));
+                }
+            }
+
+            let has_more = response
+                .last_evaluated_key
+                .as_ref()
+                .map(|key| !key.is_empty())
+                .unwrap_or(false);
+
+            if !has_more {
+                break;
+            }
+
+            last_key = response.last_evaluated_key;
+        }
+
+        let payload = Value::Array(items);
+        let json_bytes = if pretty_print {
+            serde_json::to_vec_pretty(&payload).map_err(|err| DynamoError::Local {
+                context: "Serialize export JSON",
+                details: err.to_string(),
+            })?
+        } else {
+            serde_json::to_vec(&payload).map_err(|err| DynamoError::Local {
+                context: "Serialize export JSON",
+                details: err.to_string(),
+            })?
+        };
+
+        tokio::fs::write(output_path, json_bytes)
+            .await
+            .map_err(|err| DynamoError::Local {
+                context: "Write export JSON file",
+                details: err.to_string(),
+            })?;
+
+        let item_count = payload.as_array().map_or(0, |arr| arr.len() as u64);
+        info!(table_name = %table_name, pages, item_count, output_path = %output_path.display(), "exported table to JSON file");
+
+        Ok(TableExportSummary {
+            table_name: table_name.to_string(),
+            output_path: output_path.to_string_lossy().into_owned(),
+            item_count,
+        })
+    }
+}
+
+fn attribute_map_to_json(item: std::collections::HashMap<String, AttributeValue>) -> Value {
+    let mut object = Map::new();
+    for (key, value) in item {
+        object.insert(key, attribute_value_to_json(value));
+    }
+    Value::Object(object)
+}
+
+fn attribute_value_to_json(value: AttributeValue) -> Value {
+    match value {
+        AttributeValue::S(v) => Value::String(v),
+        AttributeValue::N(v) => number_string_to_json(v),
+        AttributeValue::Bool(v) => Value::Bool(v),
+        AttributeValue::Null(_) => Value::Null,
+        AttributeValue::L(values) => {
+            Value::Array(values.into_iter().map(attribute_value_to_json).collect())
+        }
+        AttributeValue::M(map) => attribute_map_to_json(map),
+        AttributeValue::Ss(values) => Value::Array(values.into_iter().map(Value::String).collect()),
+        AttributeValue::Ns(values) => {
+            Value::Array(values.into_iter().map(number_string_to_json).collect())
+        }
+        AttributeValue::Bs(values) => {
+            let encoded = values
+                .into_iter()
+                .map(|blob| Value::String(base64_blob(blob)))
+                .collect();
+            Value::Array(encoded)
+        }
+        AttributeValue::B(blob) => Value::String(base64_blob(blob)),
+        _ => Value::String("Unsupported DynamoDB value".to_string()),
+    }
+}
+
+fn base64_blob(blob: aws_sdk_dynamodb::primitives::Blob) -> String {
+    base64::engine::general_purpose::STANDARD.encode(blob.into_inner())
+}
+
+fn number_string_to_json(value: String) -> Value {
+    if let Ok(parsed) = value.parse::<i64>() {
+        return Value::Number(Number::from(parsed));
+    }
+    if let Ok(parsed) = value.parse::<u64>() {
+        return Value::Number(Number::from(parsed));
+    }
+    if let Ok(parsed) = value.parse::<f64>()
+        && let Some(number) = Number::from_f64(parsed)
+    {
+        return Value::Number(number);
+    }
+
+    Value::String(value)
 }
 
 fn smithy_to_chrono(timestamp: aws_sdk_dynamodb::primitives::DateTime) -> Option<DateTime<Utc>> {
@@ -260,9 +410,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DynamoError, format_creation_date, normalize_page_count, normalize_table_item_count,
+        DynamoError, attribute_map_to_json, attribute_value_to_json, format_creation_date,
+        normalize_page_count, normalize_table_item_count,
     };
+    use aws_sdk_dynamodb::types::AttributeValue;
     use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
 
     #[test]
     fn normalize_page_count_single_page() {
@@ -329,5 +482,45 @@ mod tests {
         assert_eq!(parts[1].len(), 8);
         assert_eq!(parts[1].chars().filter(|ch| *ch == ':').count(), 2);
         assert!(!parts[2].is_empty());
+    }
+
+    #[test]
+    fn converts_simple_attribute_value_to_json() {
+        assert_eq!(
+            attribute_value_to_json(AttributeValue::S("abc".to_string())).to_string(),
+            "\"abc\""
+        );
+        assert_eq!(
+            attribute_value_to_json(AttributeValue::N("42".to_string())).to_string(),
+            "42"
+        );
+        assert_eq!(
+            attribute_value_to_json(AttributeValue::Bool(true)).to_string(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn converts_nested_attribute_value_to_json() {
+        let mut inner = HashMap::new();
+        inner.insert("count".to_string(), AttributeValue::N("7".to_string()));
+        inner.insert("name".to_string(), AttributeValue::S("users".to_string()));
+
+        let value = attribute_value_to_json(AttributeValue::M(inner));
+        let object = value.as_object().expect("should be object");
+        assert_eq!(object.get("count").and_then(|v| v.as_i64()), Some(7));
+        assert_eq!(object.get("name").and_then(|v| v.as_str()), Some("users"));
+    }
+
+    #[test]
+    fn converts_attribute_map_to_json_object() {
+        let mut item = HashMap::new();
+        item.insert("pk".to_string(), AttributeValue::S("A#1".to_string()));
+        item.insert("active".to_string(), AttributeValue::Bool(false));
+
+        let value = attribute_map_to_json(item);
+        let object = value.as_object().expect("should be object");
+        assert_eq!(object.get("pk").and_then(|v| v.as_str()), Some("A#1"));
+        assert_eq!(object.get("active").and_then(|v| v.as_bool()), Some(false));
     }
 }

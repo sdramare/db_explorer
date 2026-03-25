@@ -1,6 +1,8 @@
 use std::sync::mpsc::Receiver;
 
+use chrono::Local;
 use eframe::egui;
+use std::path::PathBuf;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tracing::{debug, info, warn};
 
@@ -16,6 +18,14 @@ pub enum MetadataState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportState {
+    Idle,
+    Exporting { table_name: String, output_path: PathBuf },
+    Success { table_name: String, output_path: PathBuf, item_count: u64 },
+    Error(String),
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub tables: Vec<String>,
@@ -23,9 +33,11 @@ pub struct AppState {
     pub tables_loading: bool,
     pub tables_error: Option<String>,
     pub metadata_state: MetadataState,
+    pub export_state: ExportState,
     next_request_id: u64,
     active_tables_request: Option<u64>,
     active_metadata_request: Option<u64>,
+    active_export_request: Option<u64>,
 }
 
 impl AppState {
@@ -36,9 +48,11 @@ impl AppState {
             tables_loading: false,
             tables_error: None,
             metadata_state: MetadataState::Idle,
+            export_state: ExportState::Idle,
             next_request_id: 1,
             active_tables_request: None,
             active_metadata_request: None,
+            active_export_request: None,
         }
     }
 
@@ -86,6 +100,22 @@ impl AppState {
     pub fn fail_metadata_load(&mut self, error: String) {
         self.active_metadata_request = None;
         self.metadata_state = MetadataState::Error(error);
+    }
+
+    #[must_use]
+    pub fn begin_export(&mut self, table_name: String, output_path: PathBuf) -> u64 {
+        let request_id = self.next_id();
+        self.active_export_request = Some(request_id);
+        self.export_state = ExportState::Exporting {
+            table_name,
+            output_path,
+        };
+        request_id
+    }
+
+    pub fn fail_export(&mut self, error: String) {
+        self.active_export_request = None;
+        self.export_state = ExportState::Error(error);
     }
 
     pub fn cancel_metadata_load(&mut self) -> Option<u64> {
@@ -142,11 +172,37 @@ impl AppState {
                     }
                 }
             }
+            WorkerEvent::TableExported {
+                request_id,
+                table_name,
+                output_path,
+                result,
+            } => {
+                if self.active_export_request != Some(request_id) {
+                    return;
+                }
+                self.active_export_request = None;
+
+                match result {
+                    Ok(summary) => {
+                        self.export_state = ExportState::Success {
+                            table_name,
+                            output_path,
+                            item_count: summary.item_count,
+                        };
+                    }
+                    Err(err) => {
+                        self.export_state = ExportState::Error(err);
+                    }
+                }
+            }
         }
     }
 
     pub fn has_pending_requests(&self) -> bool {
-        self.active_tables_request.is_some() || self.active_metadata_request.is_some()
+        self.active_tables_request.is_some()
+            || self.active_metadata_request.is_some()
+            || self.active_export_request.is_some()
     }
 }
 
@@ -223,6 +279,36 @@ impl DbExplorerApp {
         {
             warn!(error = ?err, "ui: failed to send cancel metadata request to worker");
         }
+    }
+
+    fn request_export(&mut self, table_name: String, output_path: PathBuf, pretty_print: bool) {
+        let request_id = self.state.begin_export(table_name.clone(), output_path.clone());
+        info!(request_id, table_name = %table_name, output_path = %output_path.display(), "ui: requesting table export");
+        if let Err(err) = self.command_tx.try_send(WorkerCommand::ExportTableToJson {
+            request_id,
+            table_name,
+            output_path,
+            pretty_print,
+        }) {
+            warn!(error = ?err, "ui: failed to send export request to worker");
+            let details = match err {
+                TrySendError::Full(_) => "worker queue is full".to_string(),
+                TrySendError::Closed(_) => "worker is unavailable".to_string(),
+            };
+            self.state
+                .fail_export(format!("Unable to export table: {details}"));
+        }
+    }
+
+    fn pick_export_path(table_name: &str) -> Option<PathBuf> {
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        let default_filename = format!("{table_name}_{timestamp}.json");
+
+        rfd::FileDialog::new()
+            .set_title("Export DynamoDB table as JSON")
+            .add_filter("JSON", &["json"])
+            .set_file_name(&default_filename)
+            .save_file()
     }
 
     fn drain_events(&mut self) -> bool {
@@ -349,6 +435,19 @@ impl eframe::App for DbExplorerApp {
                 {
                     self.cancel_metadata_load();
                 }
+
+                if ui
+                    .add_enabled(
+                        self.state.selected_table.is_some()
+                            && !matches!(self.state.export_state, ExportState::Exporting { .. }),
+                        egui::Button::new("Export JSON"),
+                    )
+                    .clicked()
+                    && let Some(selected) = self.state.selected_table.clone()
+                    && let Some(output_path) = Self::pick_export_path(&selected)
+                {
+                    self.request_export(selected, output_path, true);
+                }
             });
 
             if self.confirm_exact_recount {
@@ -367,6 +466,38 @@ impl eframe::App for DbExplorerApp {
 
             if let Some(err) = &self.state.tables_error {
                 ui.colored_label(egui::Color32::from_rgb(180, 30, 30), err);
+            }
+
+            match &self.state.export_state {
+                ExportState::Idle => {}
+                ExportState::Exporting {
+                    table_name,
+                    output_path,
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!(
+                            "Exporting '{table_name}' to {}",
+                            output_path.display()
+                        ));
+                    });
+                }
+                ExportState::Success {
+                    table_name,
+                    output_path,
+                    item_count,
+                } => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(20, 120, 20),
+                        format!(
+                            "Exported '{table_name}' ({item_count} items) to {}",
+                            output_path.display()
+                        ),
+                    );
+                }
+                ExportState::Error(err) => {
+                    ui.colored_label(egui::Color32::from_rgb(180, 30, 30), err);
+                }
             }
 
             if !self.state.tables_loading
@@ -390,12 +521,13 @@ impl eframe::App for DbExplorerApp {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
+    use std::path::PathBuf;
 
     use crate::aws::dynamodb::TableMetadata;
     use crate::messages::WorkerEvent;
     use tokio::sync::mpsc::error::TryRecvError;
 
-    use super::{AppState, DbExplorerApp, MetadataState};
+    use super::{AppState, DbExplorerApp, ExportState, MetadataState};
 
     #[test]
     fn starts_loading_tables() {
@@ -605,5 +737,55 @@ mod tests {
         });
 
         assert!(!state.has_pending_requests());
+    }
+
+    #[test]
+    fn export_success_updates_state() {
+        let mut state = AppState::new();
+        let request_id = state.begin_export(
+            "users".to_string(),
+            PathBuf::from("/tmp/users_export.json"),
+        );
+
+        state.handle_event(WorkerEvent::TableExported {
+            request_id,
+            table_name: "users".to_string(),
+            output_path: PathBuf::from("/tmp/users_export.json"),
+            result: Ok(crate::aws::dynamodb::TableExportSummary {
+                table_name: "users".to_string(),
+                output_path: "/tmp/users_export.json".to_string(),
+                item_count: 3,
+            }),
+        });
+
+        assert_eq!(
+            state.export_state,
+            ExportState::Success {
+                table_name: "users".to_string(),
+                output_path: PathBuf::from("/tmp/users_export.json"),
+                item_count: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn stale_export_response_is_ignored() {
+        let mut state = AppState::new();
+        let request_id = state.begin_export("users".to_string(), PathBuf::from("/tmp/out.json"));
+
+        state.handle_event(WorkerEvent::TableExported {
+            request_id: request_id.saturating_add(1),
+            table_name: "users".to_string(),
+            output_path: PathBuf::from("/tmp/out.json"),
+            result: Err("boom".to_string()),
+        });
+
+        assert_eq!(
+            state.export_state,
+            ExportState::Exporting {
+                table_name: "users".to_string(),
+                output_path: PathBuf::from("/tmp/out.json"),
+            }
+        );
     }
 }

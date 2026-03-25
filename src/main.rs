@@ -34,6 +34,7 @@ async fn main() -> Result<(), eframe::Error> {
         };
         let mut next_allowed_init_retry = Instant::now();
         let mut active_metadata_task: Option<JoinHandle<()>> = None;
+        let mut active_export_task: Option<JoinHandle<()>> = None;
 
         while let Some(command) = command_rx.recv().await {
             if active_metadata_task
@@ -41,6 +42,12 @@ async fn main() -> Result<(), eframe::Error> {
                 .is_some_and(tokio::task::JoinHandle::is_finished)
             {
                 active_metadata_task = None;
+            }
+            if active_export_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                active_export_task = None;
             }
 
             if service.is_none() && Instant::now() >= next_allowed_init_retry {
@@ -123,6 +130,52 @@ async fn main() -> Result<(), eframe::Error> {
                     } else {
                         info!(request_id, "worker: no active metadata load task to cancel");
                     }
+                }
+                WorkerCommand::ExportTableToJson {
+                    request_id,
+                    table_name,
+                    output_path,
+                    pretty_print,
+                } => {
+                    info!(request_id, table_name = %table_name, output_path = %output_path.display(), "worker: exporting table to json");
+                    if let Some(handle) = active_export_task.take() {
+                        handle.abort();
+                        info!("worker: aborted previous export task");
+                    }
+
+                    let event_tx = event_tx.clone();
+                    let service = service.clone();
+                    let table_name_for_task = table_name.clone();
+                    let output_path_for_task = output_path.clone();
+                    active_export_task = Some(tokio::spawn(async move {
+                        let result = match service {
+                            Some(service) => service
+                                .export_table_to_json_file(
+                                    &table_name_for_task,
+                                    &output_path_for_task,
+                                    pretty_print,
+                                )
+                                .await
+                                .map_err(|err| err.to_string()),
+                            None => Err(CLIENT_UNAVAILABLE_MSG.to_string()),
+                        };
+
+                        if let Err(err) = &result {
+                            error!(request_id, table_name = %table_name_for_task, output_path = %output_path_for_task.display(), error = %err, "worker: failed to export table");
+                        }
+
+                        if event_tx
+                            .send(WorkerEvent::TableExported {
+                                request_id,
+                                table_name,
+                                output_path,
+                                result,
+                            })
+                            .is_err()
+                        {
+                            info!("worker: event channel closed, stopping export task");
+                        }
+                    }));
                 }
             }
         }

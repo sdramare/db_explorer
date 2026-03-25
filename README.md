@@ -10,6 +10,7 @@ Desktop DynamoDB explorer built with Rust, egui/eframe, and the AWS SDK for Rust
   - Creation date
   - Item count from `DescribeTable` (approximate)
   - Optional exact recount (computed by paginated `Scan` with `Select::Count`)
+- Exports the full contents of the selected table to a local JSON file via a Save As dialog.
 - Shows loading states and user-friendly AWS error messages.
 
 ## Architecture
@@ -36,7 +37,9 @@ Request IDs are attached to every command/event pair so stale responses can be i
 6. UI sends `LoadTableMetadata`.
 7. Worker calls `DescribeTable` and sends `TableMetadataLoaded`.
 8. User can trigger an explicit exact recount for the selected table.
-9. UI state updates and re-renders.
+9. User can trigger `Export JSON` and choose a local output path.
+10. Worker scans the entire table and writes pretty-printed JSON locally.
+11. UI state updates and re-renders.
 
 ### Sequence Diagram (Runtime)
 

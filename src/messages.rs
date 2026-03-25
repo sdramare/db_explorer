@@ -1,4 +1,6 @@
-use crate::aws::dynamodb::TableMetadata;
+use std::path::PathBuf;
+
+use crate::aws::dynamodb::{TableExportSummary, TableMetadata};
 
 #[derive(Debug)]
 pub enum WorkerCommand {
@@ -13,6 +15,12 @@ pub enum WorkerCommand {
     CancelMetadataLoad {
         request_id: u64,
     },
+    ExportTableToJson {
+        request_id: u64,
+        table_name: String,
+        output_path: PathBuf,
+        pretty_print: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -25,5 +33,11 @@ pub enum WorkerEvent {
         request_id: u64,
         table_name: String,
         result: Result<TableMetadata, String>,
+    },
+    TableExported {
+        request_id: u64,
+        table_name: String,
+        output_path: PathBuf,
+        result: Result<TableExportSummary, String>,
     },
 }
