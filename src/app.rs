@@ -314,10 +314,13 @@ impl eframe::App for DbExplorerApp {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use crate::aws::dynamodb::TableMetadata;
     use crate::messages::WorkerEvent;
+    use tokio::sync::mpsc::error::TryRecvError;
 
-    use super::{AppState, MetadataState};
+    use super::{AppState, DbExplorerApp, MetadataState};
 
     #[test]
     fn starts_loading_tables() {
@@ -397,6 +400,81 @@ mod tests {
         assert!(!state.tables_loading);
         assert!(!state.has_pending_requests());
         assert_eq!(state.tables_error.as_deref(), Some("worker down"));
+    }
+
+    #[test]
+    fn app_new_requests_tables_immediately() {
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::channel();
+
+        let app = DbExplorerApp::new(command_tx, event_rx);
+
+        let command = command_rx
+            .try_recv()
+            .expect("app should request table list during startup");
+        assert!(matches!(
+            command,
+            crate::messages::WorkerCommand::LoadTables { request_id: 1 }
+        ));
+        assert!(app.state.tables_loading);
+    }
+
+    #[test]
+    fn app_new_surfaces_worker_unavailable_for_tables() {
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(command_rx);
+        let (_event_tx, event_rx) = mpsc::channel();
+
+        let app = DbExplorerApp::new(command_tx, event_rx);
+
+        assert!(!app.state.tables_loading);
+        assert!(app.state.tables_error.is_some());
+        assert!(
+            app.state
+                .tables_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Unable to request table list")
+        );
+    }
+
+    #[test]
+    fn request_metadata_surfaces_worker_unavailable() {
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::channel();
+
+        let mut app = DbExplorerApp::new(command_tx, event_rx);
+        let _ = command_rx.try_recv();
+        drop(command_rx);
+
+        app.request_metadata("users".to_string(), false);
+
+        assert!(matches!(app.state.metadata_state, MetadataState::Error(_)));
+        if let MetadataState::Error(err) = &app.state.metadata_state {
+            assert!(err.contains("Unable to request table metadata"));
+        }
+    }
+
+    #[test]
+    fn drain_events_applies_worker_updates() {
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        let mut app = DbExplorerApp::new(command_tx, event_rx);
+        let _ = command_rx.try_recv();
+
+        event_tx
+            .send(WorkerEvent::TablesLoaded {
+                request_id: 1,
+                result: Ok(vec!["users".to_string()]),
+            })
+            .expect("event should be sent");
+
+        app.drain_events();
+
+        assert!(!app.state.tables_loading);
+        assert_eq!(app.state.tables, vec!["users".to_string()]);
+        assert!(matches!(command_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
