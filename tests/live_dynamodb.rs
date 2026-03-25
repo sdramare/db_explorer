@@ -39,7 +39,7 @@ fn can_describe_first_table_with_live_aws() {
         let service = DynamoDbService::new().await;
         let tables = service.list_tables().await?;
         if let Some(first) = tables.first() {
-            let metadata = service.load_table_metadata(first).await?;
+            let metadata = service.load_table_metadata(first, false).await?;
             assert_eq!(metadata.name, *first);
         }
         Ok::<(), String>(())

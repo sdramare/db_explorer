@@ -8,7 +8,8 @@ Desktop DynamoDB explorer built with Rust, egui/eframe, and the AWS SDK for Rust
 - Lets you select a table and view metadata:
   - Table name
   - Creation date
-  - Exact item count (computed by paginated `Scan` with `Select::Count`)
+  - Item count from `DescribeTable` (approximate)
+  - Optional exact recount (computed by paginated `Scan` with `Select::Count`)
 - Shows loading states and user-friendly AWS error messages.
 
 ## Architecture
@@ -33,15 +34,16 @@ Request IDs are attached to every command/event pair so stale responses can be i
 4. Worker calls DynamoDB API and sends `TablesLoaded`.
 5. User selects a table.
 6. UI sends `LoadTableMetadata`.
-7. Worker calls `DescribeTable` and exact-count `Scan`, then sends `TableMetadataLoaded`.
-8. UI state updates and re-renders.
+7. Worker calls `DescribeTable` and sends `TableMetadataLoaded`.
+8. User can trigger an explicit exact recount for the selected table.
+9. UI state updates and re-renders.
 
 ### Sequence Diagram (Runtime)
 
 ```text
 +-------------+        WorkerCommand         +----------------+      AWS SDK Calls      +-----------+
 | egui UI App | ---------------------------> | Tokio Worker   | ----------------------> | DynamoDB  |
-| (DbExplorer)|   LoadTables {request_id}   | (background)   |   ListTables / Scan     | Service   |
+| (DbExplorer)|   LoadTables {request_id}   | (background)   |   ListTables            | Service   |
 +-------------+                              +----------------+                         +-----------+
   ^                                            |
   |               WorkerEvent                 |
@@ -52,7 +54,13 @@ Request IDs are attached to every command/event pair so stale responses can be i
   |
   |               WorkerCommand
   +------------------------------------------>
-     LoadTableMetadata {request_id, table_name}
+      LoadTableMetadata {request_id, table_name, exact_item_count=false}
+
+    | (optional exact recount)
+    |
+    |               WorkerCommand
+    +------------------------------------------>
+      LoadTableMetadata {request_id, table_name, exact_item_count=true}
 
   ^                                            |
   |               WorkerEvent                 |
@@ -84,10 +92,9 @@ Note: The UI applies events only when `request_id` matches the active request.
   - `DynamoDbService`: async AWS DynamoDB operations
     - `list_tables` with pagination
     - `load_table_metadata`
-    - `count_items_exact` via paginated scan
+    - `count_items_exact` via paginated scan (on explicit recount)
   - Error mapping for common AWS credential/permission/region failures
   - `TableMetadata` domain model
-  - `BlockingDynamoRepository` adapter for sync-style consumers/tests
 
 - `src/lib.rs`
   - Public module exports

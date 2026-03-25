@@ -27,34 +27,48 @@ async fn main() -> Result<(), eframe::Error> {
                         error!(request_id, error = %err, "worker: failed to load table list");
                     }
 
-                    let _ = event_tx.send(WorkerEvent::TablesLoaded { request_id, result });
+                    if event_tx
+                        .send(WorkerEvent::TablesLoaded { request_id, result })
+                        .is_err()
+                    {
+                        info!("worker: event channel closed, stopping worker");
+                        break;
+                    }
                 }
                 WorkerCommand::LoadTableMetadata {
                     request_id,
                     table_name,
+                    exact_item_count,
                 } => {
-                    info!(request_id, table_name = %table_name, "worker: loading table metadata");
-                    let result = service.load_table_metadata(&table_name).await;
+                    info!(request_id, table_name = %table_name, exact_item_count, "worker: loading table metadata");
+                    let result = service
+                        .load_table_metadata(&table_name, exact_item_count)
+                        .await;
                     if let Err(err) = &result {
                         error!(request_id, table_name = %table_name, error = %err, "worker: failed to load table metadata");
                     }
 
-                    let _ = event_tx.send(WorkerEvent::TableMetadataLoaded {
-                        request_id,
-                        table_name,
-                        result,
-                    });
+                    if event_tx
+                        .send(WorkerEvent::TableMetadataLoaded {
+                            request_id,
+                            table_name,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        info!("worker: event channel closed, stopping worker");
+                        break;
+                    }
                 }
             }
         }
     });
 
     let options = eframe::NativeOptions::default();
-    let app_tx = command_tx.clone();
     eframe::run_native(
         "DynamoDB Explorer",
         options,
-        Box::new(move |_cc| Ok(Box::new(DbExplorerApp::new(app_tx.clone(), event_rx)))),
+        Box::new(move |_cc| Ok(Box::new(DbExplorerApp::new(command_tx, event_rx)))),
     )
 }
 

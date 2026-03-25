@@ -8,17 +8,13 @@ pub struct TableMetadata {
     pub name: String,
     pub created_at: Option<DateTime<Utc>>,
     pub item_count: u64,
+    pub item_count_is_exact: bool,
 }
 
 impl TableMetadata {
     pub fn formatted_creation_date(&self) -> String {
         format_creation_date(self.created_at)
     }
-}
-
-pub trait DynamoRepository: Send {
-    fn list_tables(&mut self) -> Result<Vec<String>, String>;
-    fn load_table_metadata(&mut self, table_name: &str) -> Result<TableMetadata, String>;
 }
 
 pub struct DynamoDbService {
@@ -66,8 +62,12 @@ impl DynamoDbService {
         Ok(all_tables)
     }
 
-    #[instrument(name = "dynamodb.load_table_metadata", skip(self), fields(table_name = %table_name))]
-    pub async fn load_table_metadata(&self, table_name: &str) -> Result<TableMetadata, String> {
+    #[instrument(name = "dynamodb.load_table_metadata", skip(self), fields(table_name = %table_name, exact_item_count = exact_item_count))]
+    pub async fn load_table_metadata(
+        &self,
+        table_name: &str,
+        exact_item_count: bool,
+    ) -> Result<TableMetadata, String> {
         let description = self
             .client
             .describe_table()
@@ -81,14 +81,20 @@ impl DynamoDbService {
         })?;
 
         let created_at = table.creation_date_time.and_then(smithy_to_chrono);
-        let item_count = self.count_items_exact(table_name).await?;
+        let approximate_count = table.item_count.unwrap_or_default().max(0) as u64;
+        let item_count = if exact_item_count {
+            self.count_items_exact(table_name).await?
+        } else {
+            approximate_count
+        };
 
-        info!(item_count, "loaded table metadata");
+        info!(item_count, exact_item_count, "loaded table metadata");
 
         Ok(TableMetadata {
             name: table_name.to_string(),
             created_at,
             item_count,
+            item_count_is_exact: exact_item_count,
         })
     }
 
@@ -142,37 +148,12 @@ impl DynamoDbService {
     }
 }
 
-pub struct BlockingDynamoRepository {
-    runtime: tokio::runtime::Runtime,
-    service: DynamoDbService,
-}
-
-impl BlockingDynamoRepository {
-    pub fn new() -> Result<Self, String> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| format!("Failed to create async runtime: {err}"))?;
-        let service = runtime.block_on(DynamoDbService::new());
-        Ok(Self { runtime, service })
-    }
-}
-
-impl DynamoRepository for BlockingDynamoRepository {
-    fn list_tables(&mut self) -> Result<Vec<String>, String> {
-        self.runtime.block_on(self.service.list_tables())
-    }
-
-    fn load_table_metadata(&mut self, table_name: &str) -> Result<TableMetadata, String> {
-        self.runtime
-            .block_on(self.service.load_table_metadata(table_name))
-    }
-}
-
 fn smithy_to_chrono(timestamp: aws_sdk_dynamodb::primitives::DateTime) -> Option<DateTime<Utc>> {
     let seconds = timestamp.as_secs_f64();
-    let whole_seconds = seconds.trunc() as i64;
-    let nanos = ((seconds.fract()) * 1_000_000_000.0).round() as u32;
+    let whole_seconds = seconds.floor() as i64;
+    let nanos = ((seconds - whole_seconds as f64) * 1_000_000_000.0)
+        .clamp(0.0, 999_999_999.0)
+        .round() as u32;
     DateTime::<Utc>::from_timestamp(whole_seconds, nanos)
 }
 
@@ -261,8 +242,15 @@ mod tests {
             .expect("valid RFC3339")
             .with_timezone(&Utc);
         let formatted = format_creation_date(Some(timestamp));
-        assert_ne!(formatted, "Unknown");
-        assert!(formatted.contains(':'));
-        assert!(formatted.split_whitespace().count() >= 3);
+        let parts: Vec<&str> = formatted.split_whitespace().collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 10);
+        assert!(parts[0].chars().enumerate().all(|(idx, ch)| match idx {
+            4 | 7 => ch == '-',
+            _ => ch.is_ascii_digit(),
+        }));
+        assert_eq!(parts[1].len(), 8);
+        assert_eq!(parts[1].chars().filter(|ch| *ch == ':').count(), 2);
+        assert!(!parts[2].is_empty());
     }
 }

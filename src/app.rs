@@ -15,7 +15,7 @@ pub enum MetadataState {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AppState {
     pub tables: Vec<String>,
     pub selected_table: Option<String>,
@@ -47,6 +47,7 @@ impl AppState {
         id
     }
 
+    #[must_use]
     pub fn begin_tables_refresh(&mut self) -> u64 {
         let request_id = self.next_id();
         self.tables_loading = true;
@@ -55,12 +56,24 @@ impl AppState {
         request_id
     }
 
+    pub fn fail_tables_refresh(&mut self, error: String) {
+        self.tables_loading = false;
+        self.active_tables_request = None;
+        self.tables_error = Some(error);
+    }
+
+    #[must_use]
     pub fn begin_metadata_load(&mut self, table_name: String) -> u64 {
         let request_id = self.next_id();
         self.selected_table = Some(table_name);
         self.metadata_state = MetadataState::Loading;
         self.active_metadata_request = Some(request_id);
         request_id
+    }
+
+    pub fn fail_metadata_load(&mut self, error: String) {
+        self.active_metadata_request = None;
+        self.metadata_state = MetadataState::Error(error);
     }
 
     pub fn handle_event(&mut self, event: WorkerEvent) {
@@ -153,17 +166,24 @@ impl DbExplorerApp {
             .send(WorkerCommand::LoadTables { request_id })
         {
             warn!(error = %err, "ui: failed to send table list request to worker");
+            self.state.fail_tables_refresh(format!(
+                "Unable to request table list: worker is unavailable ({err})"
+            ));
         }
     }
 
-    fn request_metadata(&mut self, table_name: String) {
+    fn request_metadata(&mut self, table_name: String, exact_item_count: bool) {
         let request_id = self.state.begin_metadata_load(table_name.clone());
-        info!(request_id, table_name = %table_name, "ui: requesting table metadata");
+        info!(request_id, table_name = %table_name, exact_item_count, "ui: requesting table metadata");
         if let Err(err) = self.command_tx.send(WorkerCommand::LoadTableMetadata {
             request_id,
             table_name,
+            exact_item_count,
         }) {
             warn!(error = %err, "ui: failed to send metadata request to worker");
+            self.state.fail_metadata_load(format!(
+                "Unable to request table metadata: worker is unavailable ({err})"
+            ));
         }
     }
 
@@ -194,7 +214,12 @@ impl DbExplorerApp {
                     "Date of creation: {}",
                     metadata.formatted_creation_date()
                 ));
-                ui.label(format!("Number of items: {}", metadata.item_count));
+                let count_label = if metadata.item_count_is_exact {
+                    "Number of items (exact)"
+                } else {
+                    "Number of items (approximate)"
+                };
+                ui.label(format!("{count_label}: {}", metadata.item_count));
             }
             MetadataState::Error(err) => {
                 ui.colored_label(egui::Color32::from_rgb(180, 30, 30), err);
@@ -209,7 +234,13 @@ impl eframe::App for DbExplorerApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Refresh tables").clicked() {
+                if ui
+                    .add_enabled(
+                        !self.state.tables_loading,
+                        egui::Button::new("Refresh tables"),
+                    )
+                    .clicked()
+                {
                     info!("ui: refresh tables clicked");
                     self.request_tables();
                 }
@@ -220,24 +251,35 @@ impl eframe::App for DbExplorerApp {
                     .as_deref()
                     .unwrap_or("Select table");
 
-                let previous_selection = self.state.selected_table.clone();
+                let mut pending_selection = self.state.selected_table.clone();
+                let previous_selection = pending_selection.clone();
                 egui::ComboBox::from_label("Tables")
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
                         for table in &self.state.tables {
-                            ui.selectable_value(
-                                &mut self.state.selected_table,
-                                Some(table.clone()),
-                                table,
-                            );
+                            ui.selectable_value(&mut pending_selection, Some(table.clone()), table);
                         }
                     });
+                self.state.selected_table = pending_selection;
 
                 if self.state.selected_table != previous_selection
                     && let Some(selected) = self.state.selected_table.clone()
                 {
                     info!(table_name = %selected, "ui: table selection changed");
-                    self.request_metadata(selected);
+                    self.request_metadata(selected, false);
+                }
+
+                if ui
+                    .add_enabled(
+                        self.state.selected_table.is_some()
+                            && !matches!(self.state.metadata_state, MetadataState::Loading),
+                        egui::Button::new("Recount exactly"),
+                    )
+                    .clicked()
+                    && let Some(selected) = self.state.selected_table.clone()
+                {
+                    info!(table_name = %selected, "ui: exact recount requested");
+                    self.request_metadata(selected, true);
                 }
             });
 
@@ -313,6 +355,7 @@ mod tests {
                 name: "users".to_string(),
                 created_at: None,
                 item_count: 10,
+                item_count_is_exact: true,
             }),
         });
 
@@ -339,8 +382,65 @@ mod tests {
     #[test]
     fn selection_change_moves_to_loading() {
         let mut state = AppState::new();
-        state.begin_metadata_load("users".to_string());
+        let _request_id = state.begin_metadata_load("users".to_string());
         assert_eq!(state.selected_table.as_deref(), Some("users"));
         assert_eq!(state.metadata_state, MetadataState::Loading);
+    }
+
+    #[test]
+    fn fail_tables_refresh_clears_pending_state() {
+        let mut state = AppState::new();
+        let _ = state.begin_tables_refresh();
+
+        state.fail_tables_refresh("worker down".to_string());
+
+        assert!(!state.tables_loading);
+        assert!(!state.has_pending_requests());
+        assert_eq!(state.tables_error.as_deref(), Some("worker down"));
+    }
+
+    #[test]
+    fn fail_metadata_load_sets_error_and_clears_pending_state() {
+        let mut state = AppState::new();
+        let _ = state.begin_metadata_load("orders".to_string());
+
+        state.fail_metadata_load("worker down".to_string());
+
+        assert_eq!(
+            state.metadata_state,
+            MetadataState::Error("worker down".to_string())
+        );
+        assert!(!state.has_pending_requests());
+    }
+
+    #[test]
+    fn clears_selection_when_selected_table_missing_after_refresh() {
+        let mut state = AppState::new();
+        state.selected_table = Some("users".to_string());
+        let request_id = state.begin_tables_refresh();
+
+        state.handle_event(WorkerEvent::TablesLoaded {
+            request_id,
+            result: Ok(vec!["orders".to_string()]),
+        });
+
+        assert_eq!(state.selected_table, None);
+        assert_eq!(state.metadata_state, MetadataState::Idle);
+    }
+
+    #[test]
+    fn has_pending_requests_reflects_current_state() {
+        let mut state = AppState::new();
+        assert!(!state.has_pending_requests());
+
+        let request_id = state.begin_tables_refresh();
+        assert!(state.has_pending_requests());
+
+        state.handle_event(WorkerEvent::TablesLoaded {
+            request_id,
+            result: Ok(vec![]),
+        });
+
+        assert!(!state.has_pending_requests());
     }
 }
