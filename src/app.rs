@@ -3,7 +3,7 @@ use std::sync::mpsc::Receiver;
 use chrono::Local;
 use eframe::egui;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tracing::{debug, info, warn};
@@ -13,8 +13,12 @@ use crate::messages::{ScanStartKey, WorkerCommand, WorkerEvent};
 
 const DEFAULT_PAGE_SIZE: u32 = 20;
 const PAGE_SIZE_OPTIONS: [u32; 3] = [10, 20, 50];
-const MAX_CELL_TEXT_CHARS: usize = 80;
-const MAX_CELL_COLUMN_WIDTH: f32 = 360.0;
+const ROW_NUMBER_COLUMN_WIDTH: f32 = 52.0;
+const COLUMN_SEPARATOR_WIDTH: f32 = 8.0;
+const APPROX_CHAR_WIDTH_PX: f32 = 7.0;
+const MIN_CELL_COLUMN_WIDTH: f32 = 120.0;
+const DEFAULT_CELL_COLUMN_WIDTH: f32 = 240.0;
+const MAX_CELL_COLUMN_WIDTH: f32 = 500.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataState {
@@ -364,6 +368,7 @@ pub struct DbExplorerApp {
     command_tx: Sender<WorkerCommand>,
     event_rx: Receiver<WorkerEvent>,
     confirm_exact_recount: bool,
+    column_widths: HashMap<String, f32>,
     cell_preview_open: bool,
     cell_preview_content: String,
 }
@@ -375,6 +380,7 @@ impl DbExplorerApp {
             command_tx,
             event_rx,
             confirm_exact_recount: false,
+            column_widths: HashMap::new(),
             cell_preview_open: false,
             cell_preview_content: String::new(),
         };
@@ -585,36 +591,129 @@ impl DbExplorerApp {
             .id_salt("table_items_grid")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("table_items_grid_header")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("#");
-                        for column in &columns {
-                            ui.strong(column);
-                        }
-                        ui.end_row();
+                let table_top = ui.cursor().min.y;
+                let mut separator_xs = Vec::new();
+                let row_height = ui.spacing().interact_size.y;
 
-                        for (idx, row) in self.state.items_state.rows.iter().enumerate() {
-                            ui.label((idx + 1).to_string());
-                            for column in &columns {
+                ui.scope(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [ROW_NUMBER_COLUMN_WIDTH, row_height],
+                            egui::Label::new(egui::RichText::new("#").strong()),
+                        );
+
+                        let (first_sep_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
+                            egui::Sense::hover(),
+                        );
+                        separator_xs.push(first_sep_rect.center().x);
+
+                        for (column_index, column) in columns.iter().enumerate() {
+                            let width_entry = self
+                                .column_widths
+                                .entry(column.clone())
+                                .or_insert(DEFAULT_CELL_COLUMN_WIDTH);
+                            *width_entry = clamp_column_width(*width_entry);
+
+                            ui.add_sized(
+                                [*width_entry, row_height],
+                                egui::Label::new(egui::RichText::new(column).strong()),
+                            );
+
+                            if column_index + 1 < columns.len() {
+                                let (sep_rect, sep_response) = ui.allocate_exact_size(
+                                    egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
+                                    egui::Sense::drag(),
+                                );
+                                separator_xs.push(sep_rect.center().x);
+                                if sep_response.hovered() || sep_response.dragged() {
+                                    ui.output_mut(|output| {
+                                        output.cursor_icon = egui::CursorIcon::ResizeHorizontal;
+                                    });
+                                }
+                                if sep_response.dragged() {
+                                    let delta_x = ui.input(|i| i.pointer.delta().x);
+                                    *width_entry = clamp_column_width(*width_entry + delta_x);
+                                }
+                            }
+                        }
+                    });
+
+                    for (idx, row) in self.state.items_state.rows.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [ROW_NUMBER_COLUMN_WIDTH, row_height],
+                                egui::Label::new((idx + 1).to_string()),
+                            );
+
+                            ui.allocate_exact_size(
+                                egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
+                                egui::Sense::hover(),
+                            );
+
+                            for (column_index, column) in columns.iter().enumerate() {
+                                let width = self
+                                    .column_widths
+                                    .get(column)
+                                    .copied()
+                                    .unwrap_or(DEFAULT_CELL_COLUMN_WIDTH);
                                 let value = value_for_column(row, column);
-                                let (clipped, was_clipped) =
-                                    truncate_cell_text(&value, MAX_CELL_TEXT_CHARS);
 
                                 ui.horizontal(|ui| {
+                                    let button_width = 40.0;
+                                    let (_, clipped_on_full_width) =
+                                        truncate_cell_text_to_width(&value, width.max(1.0));
+                                    let text_width = if clipped_on_full_width {
+                                        (width - button_width).max(1.0)
+                                    } else {
+                                        width.max(1.0)
+                                    };
+                                    let (clipped, was_clipped) =
+                                        truncate_cell_text_to_width(&value, text_width);
+
                                     ui.add_sized(
-                                        [MAX_CELL_COLUMN_WIDTH, ui.spacing().interact_size.y],
+                                        [text_width, row_height],
                                         egui::Label::new(clipped),
                                     );
 
-                                    if was_clipped && ui.button("(...)").clicked() {
-                                        preview_content = Some(value.clone());
+                                    if was_clipped {
+                                        let preview_response = ui.add_sized(
+                                            [button_width, row_height],
+                                            egui::Button::new("(...)")
+                                                .sense(egui::Sense::click())
+                                                .small(),
+                                        );
+                                        if preview_response.clicked() {
+                                            preview_content = Some(value.clone());
+                                        }
                                     }
                                 });
+
+                                if column_index + 1 < columns.len() {
+                                    ui.allocate_exact_size(
+                                        egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
+                                        egui::Sense::hover(),
+                                    );
+                                }
                             }
-                            ui.end_row();
-                        }
-                    });
+                        });
+                    }
+                });
+
+                let table_bottom = ui.cursor().min.y;
+                let separator_stroke =
+                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                for separator_x in separator_xs {
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(separator_x, table_top),
+                            egui::pos2(separator_x, table_bottom),
+                        ],
+                        separator_stroke,
+                    );
+                }
 
                 ui.add_space(8.0);
                 if self.state.items_state.loading {
@@ -699,7 +798,8 @@ fn value_for_column(row: &Value, column: &str) -> String {
     }
 }
 
-fn truncate_cell_text(value: &str, max_chars: usize) -> (String, bool) {
+fn truncate_cell_text_to_width(value: &str, max_width_px: f32) -> (String, bool) {
+    let max_chars = (max_width_px / APPROX_CHAR_WIDTH_PX).floor().max(1.0) as usize;
     let total_chars = value.chars().count();
     if total_chars <= max_chars {
         return (value.to_string(), false);
@@ -707,6 +807,10 @@ fn truncate_cell_text(value: &str, max_chars: usize) -> (String, bool) {
 
     let clipped: String = value.chars().take(max_chars).collect();
     (format!("{clipped}..."), true)
+}
+
+fn clamp_column_width(width: f32) -> f32 {
+    width.clamp(MIN_CELL_COLUMN_WIDTH, MAX_CELL_COLUMN_WIDTH)
 }
 
 impl eframe::App for DbExplorerApp {
@@ -1149,16 +1253,29 @@ mod tests {
 
     #[test]
     fn truncate_cell_text_keeps_short_values() {
-        let (text, clipped) = super::truncate_cell_text("short", 10);
+        let (text, clipped) = super::truncate_cell_text_to_width("short", 80.0);
         assert_eq!(text, "short");
         assert!(!clipped);
     }
 
     #[test]
     fn truncate_cell_text_clips_long_values() {
-        let (text, clipped) = super::truncate_cell_text("abcdefghijklmnopqrstuvwxyz", 8);
+        let (text, clipped) = super::truncate_cell_text_to_width("abcdefghijklmnopqrstuvwxyz", 56.0);
         assert_eq!(text, "abcdefgh...");
         assert!(clipped);
+    }
+
+    #[test]
+    fn clamp_column_width_respects_bounds() {
+        assert_eq!(
+            super::clamp_column_width(10.0),
+            super::MIN_CELL_COLUMN_WIDTH
+        );
+        assert_eq!(super::clamp_column_width(250.0), 250.0);
+        assert_eq!(
+            super::clamp_column_width(999.0),
+            super::MAX_CELL_COLUMN_WIDTH
+        );
     }
 
     #[test]
