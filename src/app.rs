@@ -642,63 +642,76 @@ impl DbExplorerApp {
                     });
 
                     for (idx, row) in self.state.items_state.rows.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                [ROW_NUMBER_COLUMN_WIDTH, row_height],
-                                egui::Label::new((idx + 1).to_string()),
-                            );
+                        let row_fill = if idx % 2 == 0 {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            ui.visuals().extreme_bg_color
+                        };
 
-                            ui.allocate_exact_size(
-                                egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
-                                egui::Sense::hover(),
-                            );
-
-                            for (column_index, column) in columns.iter().enumerate() {
-                                let width = self
-                                    .column_widths
-                                    .get(column)
-                                    .copied()
-                                    .unwrap_or(DEFAULT_CELL_COLUMN_WIDTH);
-                                let value = value_for_column(row, column);
-
+                        egui::Frame::default()
+                            .fill(row_fill)
+                            .inner_margin(egui::Margin::same(0))
+                            .outer_margin(egui::Margin::same(0))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
                                 ui.horizontal(|ui| {
-                                    let button_width = 40.0;
-                                    let (_, clipped_on_full_width) =
-                                        truncate_cell_text_to_width(&value, width.max(1.0));
-                                    let text_width = if clipped_on_full_width {
-                                        (width - button_width).max(1.0)
-                                    } else {
-                                        width.max(1.0)
-                                    };
-                                    let (clipped, was_clipped) =
-                                        truncate_cell_text_to_width(&value, text_width);
-
                                     ui.add_sized(
-                                        [text_width, row_height],
-                                        egui::Label::new(clipped),
+                                        [ROW_NUMBER_COLUMN_WIDTH, row_height],
+                                        egui::Label::new((idx + 1).to_string()),
                                     );
 
-                                    if was_clipped {
-                                        let preview_response = ui.add_sized(
-                                            [button_width, row_height],
-                                            egui::Button::new("(...)")
-                                                .sense(egui::Sense::click())
-                                                .small(),
-                                        );
-                                        if preview_response.clicked() {
-                                            preview_content = Some(value.clone());
-                                        }
-                                    }
-                                });
-
-                                if column_index + 1 < columns.len() {
                                     ui.allocate_exact_size(
                                         egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
                                         egui::Sense::hover(),
                                     );
-                                }
-                            }
-                        });
+
+                                    for (column_index, column) in columns.iter().enumerate() {
+                                        let width = self
+                                            .column_widths
+                                            .get(column)
+                                            .copied()
+                                            .unwrap_or(DEFAULT_CELL_COLUMN_WIDTH);
+                                        let value = value_for_column(row, column);
+
+                                        ui.horizontal(|ui| {
+                                            let button_width = 40.0;
+                                            let (_, clipped_on_full_width) =
+                                                truncate_cell_text_to_width(&value, width.max(1.0));
+                                            let text_width = if clipped_on_full_width {
+                                                (width - button_width).max(1.0)
+                                            } else {
+                                                width.max(1.0)
+                                            };
+                                            let (clipped, was_clipped) =
+                                                truncate_cell_text_to_width(&value, text_width);
+
+                                            ui.add_sized(
+                                                [text_width, row_height],
+                                                egui::Label::new(clipped),
+                                            );
+
+                                            if was_clipped {
+                                                let preview_response = ui.add_sized(
+                                                    [button_width, row_height],
+                                                    egui::Button::new("(...)")
+                                                        .sense(egui::Sense::click())
+                                                        .small(),
+                                                );
+                                                if preview_response.clicked() {
+                                                    preview_content = Some(value.clone());
+                                                }
+                                            }
+                                        });
+
+                                        if column_index + 1 < columns.len() {
+                                            ui.allocate_exact_size(
+                                                egui::vec2(COLUMN_SEPARATOR_WIDTH, row_height),
+                                                egui::Sense::hover(),
+                                            );
+                                        }
+                                    }
+                                });
+                            });
                     }
                 });
 
@@ -1260,7 +1273,8 @@ mod tests {
 
     #[test]
     fn truncate_cell_text_clips_long_values() {
-        let (text, clipped) = super::truncate_cell_text_to_width("abcdefghijklmnopqrstuvwxyz", 56.0);
+        let (text, clipped) =
+            super::truncate_cell_text_to_width("abcdefghijklmnopqrstuvwxyz", 56.0);
         assert_eq!(text, "abcdefgh...");
         assert!(clipped);
     }
