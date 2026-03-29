@@ -44,38 +44,6 @@ Request IDs are attached to every command/event pair so stale responses can be i
 10. Worker scans the entire table and writes pretty-printed JSON locally.
 11. UI state updates and re-renders.
 
-### Sequence Diagram (Runtime)
-
-```text
-+-------------+        WorkerCommand         +----------------+      AWS SDK Calls      +-----------+
-| egui UI App | ---------------------------> | Tokio Worker   | ----------------------> | DynamoDB  |
-| (DbExplorer)|   LoadTables {request_id}   | (background)   |   ListTables            | Service   |
-+-------------+                              +----------------+                         +-----------+
-  ^                                            |
-  |               WorkerEvent                 |
-  | <-----------------------------------------+
-  |      TablesLoaded {request_id, result}
-  |
-  | (user selects table)
-  |
-  |               WorkerCommand
-  +------------------------------------------>
-      LoadTableMetadata {request_id, table_name, exact_item_count=false}
-
-    | (optional exact recount)
-    |
-    |               WorkerCommand
-    +------------------------------------------>
-      LoadTableMetadata {request_id, table_name, exact_item_count=true}
-
-  ^                                            |
-  |               WorkerEvent                 |
-  | <-----------------------------------------+
-  | TableMetadataLoaded {request_id, table_name, result}
-
-Note: The UI applies events only when `request_id` matches the active request.
-```
-
 ## Module Map
 
 - `src/main.rs`
