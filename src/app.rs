@@ -2,12 +2,19 @@ use std::sync::mpsc::Receiver;
 
 use chrono::Local;
 use eframe::egui;
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tokio::sync::mpsc::{Sender, error::TrySendError};
 use tracing::{debug, info, warn};
 
 use crate::aws::dynamodb::TableMetadata;
-use crate::messages::{WorkerCommand, WorkerEvent};
+use crate::messages::{ScanStartKey, WorkerCommand, WorkerEvent};
+
+const DEFAULT_PAGE_SIZE: u32 = 20;
+const PAGE_SIZE_OPTIONS: [u32; 3] = [10, 20, 50];
+const MAX_CELL_TEXT_CHARS: usize = 80;
+const MAX_CELL_COLUMN_WIDTH: f32 = 360.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataState {
@@ -21,9 +28,47 @@ pub enum MetadataState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportState {
     Idle,
-    Exporting { table_name: String, output_path: PathBuf },
-    Success { table_name: String, output_path: PathBuf, item_count: u64 },
+    Exporting {
+        table_name: String,
+        output_path: PathBuf,
+    },
+    Success {
+        table_name: String,
+        output_path: PathBuf,
+        item_count: u64,
+    },
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemLoadMode {
+    Replace,
+    Append,
+}
+
+#[derive(Debug, Clone)]
+pub struct ItemsState {
+    pub rows: Vec<Value>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub page_size: u32,
+    pub next_start_key: Option<ScanStartKey>,
+    pub has_more: bool,
+    pub loaded_once: bool,
+}
+
+impl Default for ItemsState {
+    fn default() -> Self {
+        Self {
+            rows: Vec::new(),
+            loading: false,
+            error: None,
+            page_size: DEFAULT_PAGE_SIZE,
+            next_start_key: None,
+            has_more: true,
+            loaded_once: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -34,10 +79,13 @@ pub struct AppState {
     pub tables_error: Option<String>,
     pub metadata_state: MetadataState,
     pub export_state: ExportState,
+    pub items_state: ItemsState,
     next_request_id: u64,
     active_tables_request: Option<u64>,
     active_metadata_request: Option<u64>,
     active_export_request: Option<u64>,
+    active_items_request: Option<u64>,
+    active_items_mode: Option<ItemLoadMode>,
 }
 
 impl AppState {
@@ -49,10 +97,13 @@ impl AppState {
             tables_error: None,
             metadata_state: MetadataState::Idle,
             export_state: ExportState::Idle,
+            items_state: ItemsState::default(),
             next_request_id: 1,
             active_tables_request: None,
             active_metadata_request: None,
             active_export_request: None,
+            active_items_request: None,
+            active_items_mode: None,
         }
     }
 
@@ -94,6 +145,7 @@ impl AppState {
         self.selected_table = table_name;
         self.active_metadata_request = None;
         self.metadata_state = MetadataState::Idle;
+        self.reset_items();
         true
     }
 
@@ -124,6 +176,56 @@ impl AppState {
         Some(request_id)
     }
 
+    pub fn reset_items(&mut self) {
+        self.items_state.rows.clear();
+        self.items_state.loading = false;
+        self.items_state.error = None;
+        self.items_state.next_start_key = None;
+        self.items_state.has_more = true;
+        self.items_state.loaded_once = false;
+        self.active_items_request = None;
+        self.active_items_mode = None;
+    }
+
+    #[must_use]
+    fn begin_items_load(&mut self, mode: ItemLoadMode) -> (u64, Option<ScanStartKey>, u32) {
+        let request_id = self.next_id();
+        let start_key = match mode {
+            ItemLoadMode::Replace => {
+                self.items_state.rows.clear();
+                self.items_state.next_start_key = None;
+                self.items_state.has_more = true;
+                self.items_state.loaded_once = false;
+                None
+            }
+            ItemLoadMode::Append => self.items_state.next_start_key.clone(),
+        };
+
+        self.items_state.loading = true;
+        self.items_state.error = None;
+        self.active_items_request = Some(request_id);
+        self.active_items_mode = Some(mode);
+
+        (request_id, start_key, self.items_state.page_size)
+    }
+
+    pub fn fail_items_load(&mut self, error: String) {
+        self.active_items_request = None;
+        self.active_items_mode = None;
+        self.items_state.loading = false;
+        self.items_state.error = Some(error);
+    }
+
+    pub fn set_items_page_size(&mut self, page_size: u32) -> bool {
+        if self.items_state.page_size == page_size {
+            return false;
+        }
+
+        self.items_state.page_size = page_size;
+        self.reset_items();
+        true
+    }
+
     pub fn handle_event(&mut self, event: WorkerEvent) {
         match event {
             WorkerEvent::TablesLoaded { request_id, result } => {
@@ -142,6 +244,7 @@ impl AppState {
                         {
                             self.selected_table = None;
                             self.metadata_state = MetadataState::Idle;
+                            self.reset_items();
                         }
                     }
                     Err(err) => {
@@ -149,6 +252,7 @@ impl AppState {
                         self.tables_error = Some(err);
                         self.selected_table = None;
                         self.metadata_state = MetadataState::Idle;
+                        self.reset_items();
                     }
                 }
             }
@@ -196,6 +300,48 @@ impl AppState {
                     }
                 }
             }
+            WorkerEvent::TableItemsLoaded {
+                request_id,
+                table_name,
+                result,
+            } => {
+                if self.active_items_request != Some(request_id) {
+                    return;
+                }
+
+                self.active_items_request = None;
+                self.items_state.loading = false;
+
+                if self.selected_table.as_deref() != Some(table_name.as_str()) {
+                    self.active_items_mode = None;
+                    return;
+                }
+
+                let mode = self
+                    .active_items_mode
+                    .take()
+                    .unwrap_or(ItemLoadMode::Replace);
+
+                match result {
+                    Ok(page) => {
+                        match mode {
+                            ItemLoadMode::Replace => {
+                                self.items_state.rows = page.items;
+                            }
+                            ItemLoadMode::Append => {
+                                self.items_state.rows.extend(page.items);
+                            }
+                        }
+                        self.items_state.loaded_once = true;
+                        self.items_state.error = None;
+                        self.items_state.next_start_key = page.next_start_key;
+                        self.items_state.has_more = page.has_more;
+                    }
+                    Err(err) => {
+                        self.items_state.error = Some(err);
+                    }
+                }
+            }
         }
     }
 
@@ -203,6 +349,7 @@ impl AppState {
         self.active_tables_request.is_some()
             || self.active_metadata_request.is_some()
             || self.active_export_request.is_some()
+            || self.active_items_request.is_some()
     }
 }
 
@@ -217,6 +364,8 @@ pub struct DbExplorerApp {
     command_tx: Sender<WorkerCommand>,
     event_rx: Receiver<WorkerEvent>,
     confirm_exact_recount: bool,
+    cell_preview_open: bool,
+    cell_preview_content: String,
 }
 
 impl DbExplorerApp {
@@ -226,6 +375,8 @@ impl DbExplorerApp {
             command_tx,
             event_rx,
             confirm_exact_recount: false,
+            cell_preview_open: false,
+            cell_preview_content: String::new(),
         };
         app.request_tables();
         app
@@ -282,7 +433,9 @@ impl DbExplorerApp {
     }
 
     fn request_export(&mut self, table_name: String, output_path: PathBuf, pretty_print: bool) {
-        let request_id = self.state.begin_export(table_name.clone(), output_path.clone());
+        let request_id = self
+            .state
+            .begin_export(table_name.clone(), output_path.clone());
         info!(request_id, table_name = %table_name, output_path = %output_path.display(), "ui: requesting table export");
         if let Err(err) = self.command_tx.try_send(WorkerCommand::ExportTableToJson {
             request_id,
@@ -297,6 +450,39 @@ impl DbExplorerApp {
             };
             self.state
                 .fail_export(format!("Unable to export table: {details}"));
+        }
+    }
+
+    fn request_items_reload(&mut self, table_name: String) {
+        self.request_items(table_name, ItemLoadMode::Replace);
+    }
+
+    fn request_items_next_page(&mut self, table_name: String) {
+        if self.state.items_state.loading
+            || !self.state.items_state.has_more
+            || self.state.items_state.next_start_key.is_none()
+        {
+            return;
+        }
+        self.request_items(table_name, ItemLoadMode::Append);
+    }
+
+    fn request_items(&mut self, table_name: String, mode: ItemLoadMode) {
+        let (request_id, exclusive_start_key, page_size) = self.state.begin_items_load(mode);
+        info!(request_id, table_name = %table_name, page_size, ?mode, "ui: requesting table items page");
+        if let Err(err) = self.command_tx.try_send(WorkerCommand::LoadTableItems {
+            request_id,
+            table_name,
+            page_size,
+            exclusive_start_key,
+        }) {
+            warn!(error = ?err, "ui: failed to send items request to worker");
+            let details = match err {
+                TrySendError::Full(_) => "worker queue is full".to_string(),
+                TrySendError::Closed(_) => "worker is unavailable".to_string(),
+            };
+            self.state
+                .fail_items_load(format!("Unable to load table items: {details}"));
         }
     }
 
@@ -360,6 +546,167 @@ impl DbExplorerApp {
             }
         }
     }
+
+    fn render_items_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Table Items");
+        ui.separator();
+
+        if self.state.selected_table.is_none() {
+            ui.label("Select a table to view items.");
+            return;
+        }
+
+        if let Some(err) = &self.state.items_state.error {
+            ui.colored_label(egui::Color32::from_rgb(180, 30, 30), err);
+        }
+
+        if self.state.items_state.rows.is_empty() {
+            if self.state.items_state.loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading items...");
+                });
+                return;
+            }
+
+            if self.state.items_state.loaded_once {
+                ui.label("No items in table.");
+            } else {
+                ui.label("No items loaded yet.");
+            }
+            return;
+        }
+
+        let columns = collect_item_columns(&self.state.items_state.rows);
+        let mut request_more = false;
+        let mut preview_content: Option<String> = None;
+
+        egui::ScrollArea::both()
+            .id_salt("table_items_grid")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("table_items_grid_header")
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("#");
+                        for column in &columns {
+                            ui.strong(column);
+                        }
+                        ui.end_row();
+
+                        for (idx, row) in self.state.items_state.rows.iter().enumerate() {
+                            ui.label((idx + 1).to_string());
+                            for column in &columns {
+                                let value = value_for_column(row, column);
+                                let (clipped, was_clipped) =
+                                    truncate_cell_text(&value, MAX_CELL_TEXT_CHARS);
+
+                                ui.horizontal(|ui| {
+                                    ui.add_sized(
+                                        [MAX_CELL_COLUMN_WIDTH, ui.spacing().interact_size.y],
+                                        egui::Label::new(clipped),
+                                    );
+
+                                    if was_clipped && ui.button("(...)").clicked() {
+                                        preview_content = Some(value.clone());
+                                    }
+                                });
+                            }
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(8.0);
+                if self.state.items_state.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading more items...");
+                    });
+                } else if self.state.items_state.has_more {
+                    let sentinel = ui.label("Scroll to load more...");
+                    request_more = ui.is_rect_visible(sentinel.rect);
+                } else {
+                    ui.label("End of results.");
+                }
+            });
+
+        if request_more
+            && !self.state.items_state.loading
+            && self.state.items_state.has_more
+            && self.state.items_state.error.is_none()
+            && let Some(selected) = self.state.selected_table.clone()
+        {
+            self.request_items_next_page(selected);
+        }
+
+        if let Some(content) = preview_content {
+            self.cell_preview_content = content;
+            self.cell_preview_open = true;
+        }
+    }
+
+    fn render_cell_preview_window(&mut self, ctx: &egui::Context) {
+        if !self.cell_preview_open {
+            return;
+        }
+
+        egui::Window::new("Cell content")
+            .open(&mut self.cell_preview_open)
+            .resizable(true)
+            .vscroll(true)
+            .show(ctx, |ui| {
+                ui.set_min_width(720.0);
+                ui.label("Full cell value");
+                ui.separator();
+                egui::ScrollArea::both().show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.cell_preview_content)
+                            .interactive(false)
+                            .desired_rows(24)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            });
+    }
+}
+
+fn collect_item_columns(rows: &[Value]) -> Vec<String> {
+    let mut columns = BTreeSet::new();
+    for row in rows {
+        if let Value::Object(map) = row {
+            for key in map.keys() {
+                columns.insert(key.clone());
+            }
+        }
+    }
+
+    columns.into_iter().collect()
+}
+
+fn value_for_column(row: &Value, column: &str) -> String {
+    let Some(value) = row.as_object().and_then(|obj| obj.get(column)) else {
+        return String::new();
+    };
+
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(v) => v.clone(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "<unprintable json>".to_string())
+        }
+    }
+}
+
+fn truncate_cell_text(value: &str, max_chars: usize) -> (String, bool) {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return (value.to_string(), false);
+    }
+
+    let clipped: String = value.chars().take(max_chars).collect();
+    (format!("{clipped}..."), true)
 }
 
 impl eframe::App for DbExplorerApp {
@@ -399,7 +746,33 @@ impl eframe::App for DbExplorerApp {
                     && let Some(selected) = self.state.selected_table.clone()
                 {
                     info!(table_name = %selected, "ui: table selection changed");
-                    self.request_metadata(selected, false);
+                    self.request_metadata(selected.clone(), false);
+                    self.request_items_reload(selected);
+                }
+
+                let mut pending_page_size = self.state.items_state.page_size;
+                egui::ComboBox::from_label("Page size")
+                    .selected_text(pending_page_size.to_string())
+                    .show_ui(ui, |ui| {
+                        for size in PAGE_SIZE_OPTIONS {
+                            ui.selectable_value(&mut pending_page_size, size, size.to_string());
+                        }
+                    });
+                if self.state.set_items_page_size(pending_page_size)
+                    && let Some(selected) = self.state.selected_table.clone()
+                {
+                    self.request_items_reload(selected);
+                }
+
+                if ui
+                    .add_enabled(
+                        self.state.selected_table.is_some() && !self.state.items_state.loading,
+                        egui::Button::new("Reload items"),
+                    )
+                    .clicked()
+                    && let Some(selected) = self.state.selected_table.clone()
+                {
+                    self.request_items_reload(selected);
                 }
 
                 let recount_label = if self.confirm_exact_recount {
@@ -510,7 +883,11 @@ impl eframe::App for DbExplorerApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_metadata_panel(ui);
+            ui.add_space(12.0);
+            self.render_items_panel(ui);
         });
+
+        self.render_cell_preview_window(ctx);
 
         if events_processed || self.state.has_pending_requests() {
             ctx.request_repaint();
@@ -520,11 +897,12 @@ impl eframe::App for DbExplorerApp {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
     use std::path::PathBuf;
+    use std::sync::mpsc;
 
     use crate::aws::dynamodb::TableMetadata;
-    use crate::messages::WorkerEvent;
+    use crate::messages::{TableItemsPage, WorkerEvent};
+    use serde_json::json;
     use tokio::sync::mpsc::error::TryRecvError;
 
     use super::{AppState, DbExplorerApp, ExportState, MetadataState};
@@ -699,6 +1077,91 @@ mod tests {
     }
 
     #[test]
+    fn item_reload_replaces_rows() {
+        let mut state = AppState::new();
+        state.update_selected_table(Some("users".to_string()));
+
+        let (request_id, _, _) = state.begin_items_load(super::ItemLoadMode::Replace);
+        state.handle_event(WorkerEvent::TableItemsLoaded {
+            request_id,
+            table_name: "users".to_string(),
+            result: Ok(TableItemsPage {
+                items: vec![json!({"pk": "u#1"})],
+                next_start_key: None,
+                has_more: false,
+            }),
+        });
+
+        assert_eq!(state.items_state.rows.len(), 1);
+        assert!(state.items_state.loaded_once);
+        assert!(!state.items_state.has_more);
+    }
+
+    #[test]
+    fn item_append_extends_rows() {
+        let mut state = AppState::new();
+        state.update_selected_table(Some("users".to_string()));
+
+        let (first_request, _, _) = state.begin_items_load(super::ItemLoadMode::Replace);
+        state.handle_event(WorkerEvent::TableItemsLoaded {
+            request_id: first_request,
+            table_name: "users".to_string(),
+            result: Ok(TableItemsPage {
+                items: vec![json!({"pk": "u#1"})],
+                next_start_key: Some(std::collections::HashMap::new()),
+                has_more: true,
+            }),
+        });
+
+        let (second_request, _, _) = state.begin_items_load(super::ItemLoadMode::Append);
+        state.handle_event(WorkerEvent::TableItemsLoaded {
+            request_id: second_request,
+            table_name: "users".to_string(),
+            result: Ok(TableItemsPage {
+                items: vec![json!({"pk": "u#2"})],
+                next_start_key: None,
+                has_more: false,
+            }),
+        });
+
+        assert_eq!(state.items_state.rows.len(), 2);
+    }
+
+    #[test]
+    fn stale_item_response_is_ignored() {
+        let mut state = AppState::new();
+        state.update_selected_table(Some("users".to_string()));
+
+        let (request_id, _, _) = state.begin_items_load(super::ItemLoadMode::Replace);
+        state.handle_event(WorkerEvent::TableItemsLoaded {
+            request_id: request_id.saturating_add(1),
+            table_name: "users".to_string(),
+            result: Ok(TableItemsPage {
+                items: vec![json!({"pk": "u#1"})],
+                next_start_key: None,
+                has_more: false,
+            }),
+        });
+
+        assert!(state.items_state.rows.is_empty());
+        assert!(state.items_state.loading);
+    }
+
+    #[test]
+    fn truncate_cell_text_keeps_short_values() {
+        let (text, clipped) = super::truncate_cell_text("short", 10);
+        assert_eq!(text, "short");
+        assert!(!clipped);
+    }
+
+    #[test]
+    fn truncate_cell_text_clips_long_values() {
+        let (text, clipped) = super::truncate_cell_text("abcdefghijklmnopqrstuvwxyz", 8);
+        assert_eq!(text, "abcdefgh...");
+        assert!(clipped);
+    }
+
+    #[test]
     fn cancel_metadata_load_clears_pending_state() {
         let mut state = AppState::new();
         let request_id = state.begin_metadata_load("orders");
@@ -742,10 +1205,8 @@ mod tests {
     #[test]
     fn export_success_updates_state() {
         let mut state = AppState::new();
-        let request_id = state.begin_export(
-            "users".to_string(),
-            PathBuf::from("/tmp/users_export.json"),
-        );
+        let request_id =
+            state.begin_export("users".to_string(), PathBuf::from("/tmp/users_export.json"));
 
         state.handle_event(WorkerEvent::TableExported {
             request_id,

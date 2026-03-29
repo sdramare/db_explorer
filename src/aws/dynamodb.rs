@@ -9,6 +9,8 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
+use crate::messages::{ScanStartKey, TableItemsPage};
+
 const EXACT_COUNT_WARN_THRESHOLD_PAGES: u64 = 100;
 const EXACT_COUNT_MAX_PAGES: u64 = 10_000;
 const EXPORT_WARN_THRESHOLD_PAGES: u64 = 100;
@@ -284,6 +286,43 @@ impl DynamoDbService {
             item_count,
         })
     }
+
+    #[instrument(name = "dynamodb.load_table_items_page", skip(self, exclusive_start_key), fields(table_name = %table_name, page_size = page_size))]
+    pub async fn load_table_items_page(
+        &self,
+        table_name: &str,
+        page_size: u32,
+        exclusive_start_key: Option<ScanStartKey>,
+    ) -> Result<TableItemsPage, DynamoError> {
+        let mut request = self
+            .client
+            .scan()
+            .table_name(table_name)
+            .limit(normalize_page_size(page_size));
+        if let Some(key) = exclusive_start_key {
+            request = request.set_exclusive_start_key(Some(key));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|err| map_sdk_error("Load table items", &err))?;
+
+        let mut items = Vec::new();
+        if let Some(page_items) = response.items {
+            for item in page_items {
+                items.push(attribute_map_to_json(item));
+            }
+        }
+
+        let next_start_key = response.last_evaluated_key.filter(|key| !key.is_empty());
+
+        Ok(TableItemsPage {
+            has_more: next_start_key.is_some(),
+            items,
+            next_start_key,
+        })
+    }
 }
 
 fn attribute_map_to_json(item: std::collections::HashMap<String, AttributeValue>) -> Value {
@@ -362,6 +401,10 @@ fn normalize_table_item_count(item_count: Option<i64>) -> u64 {
     item_count.unwrap_or_default().max(0) as u64
 }
 
+fn normalize_page_size(page_size: u32) -> i32 {
+    page_size.clamp(1, i32::MAX as u32) as i32
+}
+
 fn map_sdk_error<E, R>(context: &'static str, err: &SdkError<E, R>) -> DynamoError
 where
     E: ProvideErrorMetadata,
@@ -411,7 +454,7 @@ where
 mod tests {
     use super::{
         DynamoError, attribute_map_to_json, attribute_value_to_json, format_creation_date,
-        normalize_page_count, normalize_table_item_count,
+        normalize_page_count, normalize_page_size, normalize_table_item_count,
     };
     use aws_sdk_dynamodb::types::AttributeValue;
     use chrono::{DateTime, Utc};
@@ -442,6 +485,12 @@ mod tests {
         assert_eq!(normalize_table_item_count(Some(12)), 12);
         assert_eq!(normalize_table_item_count(Some(-1)), 0);
         assert_eq!(normalize_table_item_count(None), 0);
+    }
+
+    #[test]
+    fn normalize_page_size_is_clamped() {
+        assert_eq!(normalize_page_size(0), 1);
+        assert_eq!(normalize_page_size(20), 20);
     }
 
     #[test]

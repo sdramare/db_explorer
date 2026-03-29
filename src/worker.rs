@@ -15,6 +15,7 @@ struct WorkerRuntime {
     next_allowed_init_retry: Instant,
     active_metadata_task: Option<JoinHandle<()>>,
     active_export_task: Option<JoinHandle<()>>,
+    active_items_task: Option<JoinHandle<()>>,
 }
 
 impl WorkerRuntime {
@@ -24,6 +25,7 @@ impl WorkerRuntime {
             next_allowed_init_retry: Instant::now(),
             active_metadata_task: None,
             active_export_task: None,
+            active_items_task: None,
         }
     }
 
@@ -41,6 +43,13 @@ impl WorkerRuntime {
             .is_some_and(tokio::task::JoinHandle::is_finished)
         {
             self.active_export_task = None;
+        }
+        if self
+            .active_items_task
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            self.active_items_task = None;
         }
     }
 
@@ -95,6 +104,21 @@ impl WorkerRuntime {
                     table_name,
                     output_path,
                     pretty_print,
+                    event_tx,
+                );
+                true
+            }
+            WorkerCommand::LoadTableItems {
+                request_id,
+                table_name,
+                page_size,
+                exclusive_start_key,
+            } => {
+                self.handle_load_table_items(
+                    request_id,
+                    table_name,
+                    page_size,
+                    exclusive_start_key,
                     event_tx,
                 );
                 true
@@ -223,6 +247,49 @@ impl WorkerRuntime {
                 .is_err()
             {
                 info!("worker: event channel closed, stopping export task");
+            }
+        }));
+    }
+
+    fn handle_load_table_items(
+        &mut self,
+        request_id: u64,
+        table_name: String,
+        page_size: u32,
+        exclusive_start_key: Option<crate::messages::ScanStartKey>,
+        event_tx: &mpsc::Sender<WorkerEvent>,
+    ) {
+        info!(request_id, table_name = %table_name, page_size, "worker: loading table items page");
+        if let Some(handle) = self.active_items_task.take() {
+            handle.abort();
+            info!(request_id, "worker: aborted previous item load task");
+        }
+
+        let event_tx = event_tx.clone();
+        let service = self.service.clone();
+        let table_name_for_task = table_name.clone();
+        self.active_items_task = Some(tokio::spawn(async move {
+            let result = match service {
+                Some(service) => service
+                    .load_table_items_page(&table_name_for_task, page_size, exclusive_start_key)
+                    .await
+                    .map_err(|err| err.to_string()),
+                None => Err(CLIENT_UNAVAILABLE_MSG.to_string()),
+            };
+
+            if let Err(err) = &result {
+                error!(request_id, table_name = %table_name_for_task, error = %err, "worker: failed to load table items page");
+            }
+
+            if event_tx
+                .send(WorkerEvent::TableItemsLoaded {
+                    request_id,
+                    table_name,
+                    result,
+                })
+                .is_err()
+            {
+                info!("worker: event channel closed, stopping items task");
             }
         }));
     }
@@ -356,6 +423,42 @@ mod tests {
                 assert_eq!(request_id, 19);
                 assert_eq!(table_name, "orders");
                 assert_eq!(output_path, PathBuf::from("/tmp/orders.json"));
+                assert!(result.is_err());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_table_items_without_service_emits_unavailable_error() {
+        let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+        let mut runtime = WorkerRuntime::new(None);
+
+        let should_continue = runtime
+            .handle_command(
+                WorkerCommand::LoadTableItems {
+                    request_id: 23,
+                    table_name: "users".to_string(),
+                    page_size: 20,
+                    exclusive_start_key: None,
+                },
+                &event_tx,
+            )
+            .await;
+
+        if let Some(handle) = runtime.active_items_task.take() {
+            let _ = handle.await;
+        }
+
+        assert!(should_continue);
+        match recv_event(&event_rx) {
+            WorkerEvent::TableItemsLoaded {
+                request_id,
+                table_name,
+                result,
+            } => {
+                assert_eq!(request_id, 23);
+                assert_eq!(table_name, "users");
                 assert!(result.is_err());
             }
             other => panic!("unexpected event: {other:?}"),

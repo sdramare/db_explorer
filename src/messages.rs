@@ -1,6 +1,18 @@
 use std::path::PathBuf;
 
+use aws_sdk_dynamodb::types::AttributeValue;
+use serde_json::Value;
+
 use crate::aws::dynamodb::{TableExportSummary, TableMetadata};
+
+pub type ScanStartKey = std::collections::HashMap<String, AttributeValue>;
+
+#[derive(Debug, Clone)]
+pub struct TableItemsPage {
+    pub items: Vec<Value>,
+    pub next_start_key: Option<ScanStartKey>,
+    pub has_more: bool,
+}
 
 #[derive(Debug)]
 pub enum WorkerCommand {
@@ -21,6 +33,12 @@ pub enum WorkerCommand {
         output_path: PathBuf,
         pretty_print: bool,
     },
+    LoadTableItems {
+        request_id: u64,
+        table_name: String,
+        page_size: u32,
+        exclusive_start_key: Option<ScanStartKey>,
+    },
 }
 
 #[derive(Debug)]
@@ -39,5 +57,10 @@ pub enum WorkerEvent {
         table_name: String,
         output_path: PathBuf,
         result: Result<TableExportSummary, String>,
+    },
+    TableItemsLoaded {
+        request_id: u64,
+        table_name: String,
+        result: Result<TableItemsPage, String>,
     },
 }
