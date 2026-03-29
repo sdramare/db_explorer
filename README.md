@@ -2,6 +2,9 @@
 
 Desktop DynamoDB explorer built with Rust, egui/eframe, and the AWS SDK for Rust.
 
+<img width="1824" height="1480" alt="image" src="https://github.com/user-attachments/assets/1a67ddd4-fb46-4d11-bc0e-5dd07d018f13" />
+
+
 ## What It Does
 
 - Lists DynamoDB tables for the active AWS profile and region.
